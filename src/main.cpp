@@ -66,6 +66,8 @@ const uint16_t TOUCH_DEBOUNCE_MS = 35;
 const uint16_t TOUCH_LONG_MS = 720;
 const uint16_t TOUCH_DOUBLE_TAP_MS = 330;
 const uint8_t REMINDER_TEXT_MAX = 32;
+const uint8_t REMINDER_MAX_SLOTS = 5;
+const uint8_t REMINDER_SERIAL_MAX = 220;
 const long GMT_OFFSET_SEC = 7L * 3600L;
 const int DAYLIGHT_OFFSET_SEC = 0;
 
@@ -254,6 +256,22 @@ uint8_t reminderIntervalIndex = 0;
 uint8_t reminderHour = 7;
 uint8_t reminderMinute = 30;
 int reminderLastYday = -1;
+struct ReminderSlot {
+  bool enabled;
+  uint8_t hour;
+  uint8_t minute;
+  int lastYday;
+  char text[REMINDER_TEXT_MAX + 1];
+};
+ReminderSlot reminderSlots[REMINDER_MAX_SLOTS] = {
+  {true, 7, 30, -1, "enroll lagi ya deck"},
+  {false, 0, 0, -1, ""},
+  {false, 0, 0, -1, ""},
+  {false, 0, 0, -1, ""},
+  {false, 0, 0, -1, ""}
+};
+uint8_t activeReminderSlot = 0;
+uint8_t reminderSlotCount = 1;
 bool wifiStarted = false;
 bool geminiActive = false;
 String geminiStatus = "AI OFF";
@@ -273,7 +291,7 @@ bool serialHexReceiving = false;
 uint16_t serialHexIndex = 0;
 int8_t serialHexHighNibble = -1;
 bool serialReminderReceiving = false;
-char serialReminderBuffer[REMINDER_TEXT_MAX + 1];
+char serialReminderBuffer[REMINDER_SERIAL_MAX + 1];
 uint8_t serialReminderIndex = 0;
 char reminderText[REMINDER_TEXT_MAX + 1] = "enroll lagi ya deck";
 String webCommand = "";
@@ -299,6 +317,12 @@ int alienX = 116;
 int alienY = 18;
 int alienVelY = 1;
 uint8_t spaceScore = 0;
+int alienVelX = 1;
+uint8_t spaceLives = 3;
+uint8_t spaceTargetScore = 12;
+bool spaceGameOver = false;
+bool spacePlayerWon = false;
+unsigned long spaceHitFlashUntilMs = 0UL;
 
 const uint8_t REMINDER_INTERVAL_MINUTES[] = {1, 5, 15, 30, 60};
 
@@ -349,6 +373,7 @@ void showFaceScreen();
 void toggleReminder(unsigned long now);
 void setReminderText(const char* text);
 void setReminderSchedule(const char* payload, unsigned long now);
+void setReminderSlots(const char* payload, unsigned long now);
 void startSelectedGame(unsigned long now);
 
 bool secretsConfigured() {
@@ -689,15 +714,22 @@ void updateReminder(unsigned long now) {
     if (!getLocalTime(&timeinfo, 20)) {
       return;
     } else {
-      if (!reminder.active &&
-          timeinfo.tm_hour == reminderHour &&
-          timeinfo.tm_min == reminderMinute &&
-          timeinfo.tm_yday != reminderLastYday) {
-        reminder.active = true;
-        reminder.lastTriggeredMs = now;
-        reminder.activeUntilMs = now + REMINDER_VISIBLE_MS;
-        reminder.count++;
-        reminderLastYday = timeinfo.tm_yday;
+      if (!reminder.active) {
+        for (uint8_t i = 0; i < REMINDER_MAX_SLOTS; i++) {
+          if (reminderSlots[i].enabled &&
+              timeinfo.tm_hour == reminderSlots[i].hour &&
+              timeinfo.tm_min == reminderSlots[i].minute &&
+              timeinfo.tm_yday != reminderSlots[i].lastYday) {
+            activeReminderSlot = i;
+            setReminderText(reminderSlots[i].text);
+            reminder.active = true;
+            reminder.lastTriggeredMs = now;
+            reminder.activeUntilMs = now + REMINDER_VISIBLE_MS;
+            reminder.count++;
+            reminderSlots[i].lastYday = timeinfo.tm_yday;
+            break;
+          }
+        }
       }
 
       if (reminder.active) {
@@ -977,7 +1009,7 @@ void updateSerialFrame(unsigned long now) {
     if (serialReminderReceiving) {
       if (b == '\n' || b == '\r') {
         serialReminderBuffer[serialReminderIndex] = '\0';
-        setReminderSchedule(serialReminderBuffer, now);
+        setReminderSlots(serialReminderBuffer, now);
         serialReminderReceiving = false;
         Serial.print("REMINDER TEXT: ");
         Serial.println(reminderText);
@@ -988,7 +1020,7 @@ void updateSerialFrame(unsigned long now) {
         }
         continue;
       }
-      if (serialReminderIndex < REMINDER_TEXT_MAX && b >= 32 && b <= 126) {
+      if (serialReminderIndex < REMINDER_SERIAL_MAX && b >= 32 && b <= 126) {
         serialReminderBuffer[serialReminderIndex++] = (char)b;
       }
       continue;
@@ -2465,6 +2497,102 @@ void setReminderSchedule(const char* payload, unsigned long now) {
   setReminderText(payload);
 }
 
+bool parseReminderItem(const char* item, ReminderSlot& slot) {
+  if (item[0] >= '0' && item[0] <= '2' &&
+      item[1] >= '0' && item[1] <= '9' &&
+      item[2] == ':' &&
+      item[3] >= '0' && item[3] <= '5' &&
+      item[4] >= '0' && item[4] <= '9' &&
+      item[5] == '|') {
+    uint8_t hh = (item[0] - '0') * 10 + (item[1] - '0');
+    uint8_t mm = (item[3] - '0') * 10 + (item[4] - '0');
+    if (hh >= 24 || mm >= 60) return false;
+
+    slot.enabled = true;
+    slot.hour = hh;
+    slot.minute = mm;
+    slot.lastYday = -1;
+
+    uint8_t out = 0;
+    const char* text = item + 6;
+    for (uint8_t i = 0; text[i] != '\0' && out < REMINDER_TEXT_MAX; i++) {
+      char c = text[i];
+      if (c >= 32 && c <= 126) slot.text[out++] = c;
+    }
+    slot.text[out] = '\0';
+    if (out == 0) {
+      strncpy(slot.text, "enroll lagi ya deck", REMINDER_TEXT_MAX);
+      slot.text[REMINDER_TEXT_MAX] = '\0';
+    }
+    return true;
+  }
+  return false;
+}
+
+void clearReminderSlots() {
+  for (uint8_t i = 0; i < REMINDER_MAX_SLOTS; i++) {
+    reminderSlots[i].enabled = false;
+    reminderSlots[i].hour = 0;
+    reminderSlots[i].minute = 0;
+    reminderSlots[i].lastYday = -1;
+    reminderSlots[i].text[0] = '\0';
+  }
+  reminderSlotCount = 0;
+}
+
+void setReminderSlots(const char* payload, unsigned long now) {
+  if (strncmp(payload, "A:", 2) == 0) {
+    clearReminderSlots();
+    char copy[196];
+    strncpy(copy, payload + 2, sizeof(copy) - 1);
+    copy[sizeof(copy) - 1] = '\0';
+
+    char* item = strtok(copy, ";");
+    while (item != nullptr && reminderSlotCount < REMINDER_MAX_SLOTS) {
+      ReminderSlot slot;
+      if (parseReminderItem(item, slot)) {
+        reminderSlots[reminderSlotCount++] = slot;
+      }
+      item = strtok(nullptr, ";");
+    }
+
+    if (reminderSlotCount == 0) {
+      reminderSlots[0].enabled = true;
+      reminderSlots[0].hour = 7;
+      reminderSlots[0].minute = 30;
+      reminderSlots[0].lastYday = -1;
+      strncpy(reminderSlots[0].text, "enroll lagi ya deck", REMINDER_TEXT_MAX);
+      reminderSlots[0].text[REMINDER_TEXT_MAX] = '\0';
+      reminderSlotCount = 1;
+    }
+
+    reminderHour = reminderSlots[0].hour;
+    reminderMinute = reminderSlots[0].minute;
+    reminderLastYday = -1;
+    activeReminderSlot = 0;
+    setReminderText(reminderSlots[0].text);
+    reminderClockMode = true;
+    reminderEnabled = true;
+    reminder.active = false;
+    reminder.activeUntilMs = 0UL;
+    reminder.nextAtMs = 0UL;
+    webCommand = "REMINDER LIST";
+    webCommandUntilMs = now + 900UL;
+    return;
+  }
+
+  setReminderSchedule(payload, now);
+  if (reminderClockMode) {
+    reminderSlots[0].enabled = true;
+    reminderSlots[0].hour = reminderHour;
+    reminderSlots[0].minute = reminderMinute;
+    reminderSlots[0].lastYday = -1;
+    strncpy(reminderSlots[0].text, reminderText, REMINDER_TEXT_MAX);
+    reminderSlots[0].text[REMINDER_TEXT_MAX] = '\0';
+    reminderSlotCount = 1;
+  }
+}
+
 void drawCenteredTextLine(const char* text, int y, uint8_t size) {
   int width = strlen(text) * 6 * size;
   int x = (SCREEN_WIDTH - width) / 2;
@@ -2692,7 +2820,7 @@ void cycleReminderInterval(unsigned long now) {
 void toggleReminder(unsigned long now) {
   reminderEnabled = !reminderEnabled;
   reminder.active = false;
-  reminder.nextAtMs = reminderEnabled ? now + reminderIntervalMs() : 0UL;
+  reminder.nextAtMs = (reminderEnabled && !reminderClockMode) ? now + reminderIntervalMs() : 0UL;
 }
 
 void adjustCurrentMenu(unsigned long now) {
@@ -2757,7 +2885,12 @@ void startSelectedGame(unsigned long now) {
     alienX = 116;
     alienY = 18;
     alienVelY = 1;
+    alienVelX = 1;
     spaceScore = 0;
+    spaceLives = 3;
+    spaceGameOver = false;
+    spacePlayerWon = false;
+    spaceHitFlashUntilMs = 0UL;
   }
 }
 
@@ -2781,8 +2914,14 @@ void handleGameTap(unsigned long now) {
     if (pingPaddleY < 15) pingPaddleY = 15;
     if (pingPaddleY > 45) pingPaddleY = 45;
   } else if (runningGame == GAME_SPACE) {
-    shipY += 12;
-    if (shipY > 52) shipY = 17;
+    if (spaceGameOver) {
+      startSelectedGame(now);
+      return;
+    }
+    if (alienY < shipY - 3) shipY -= 9;
+    else shipY += 9;
+    if (shipY < 18) shipY = 18;
+    if (shipY > 55) shipY = 55;
     if (bulletX < 0) {
       bulletX = 23;
       bulletY = shipY;
@@ -3074,37 +3213,74 @@ void drawMinigameScreen(unsigned long now) {
   }
 
   if (runningGame == GAME_SPACE) {
-    if (now - gameLastMs > 40UL) {
+    if (spaceGameOver) {
+      display.setTextColor(SSD1306_WHITE);
+      display.drawRoundRect(6, 15, 116, 45, 5, SSD1306_WHITE);
+      display.setTextSize(2);
+      display.setCursor(spacePlayerWon ? 20 : 14, 21);
+      display.print(spacePlayerWon ? "YOU WIN" : "YOU LOSE");
+      display.setTextSize(1);
+      display.setCursor(36, 43);
+      display.print("SCORE ");
+      display.print(spaceScore);
+      return;
+    }
+
+    if (now - gameLastMs > 32UL) {
       gameLastMs = now;
+      alienVelX = 1 + (spaceScore / 4);
+      if (alienVelX > 3) alienVelX = 3;
       alienY += alienVelY;
       if (alienY <= 17 || alienY >= 55) alienVelY = -alienVelY;
-      alienX -= 1;
-      if (alienX < 32) {
+      alienX -= alienVelX;
+      if (alienX < 20) {
+        if (spaceLives > 0) spaceLives--;
+        spaceHitFlashUntilMs = now + 450UL;
+        if (spaceLives == 0) {
+          spaceGameOver = true;
+          spacePlayerWon = false;
+        }
         alienX = 116;
         alienY = random(18, 54);
+        alienVelY = random(0, 2) == 0 ? -1 : 1;
       }
-      if (bulletX >= 0) bulletX += 4;
+      if (bulletX >= 0) bulletX += 5;
       if (bulletX > 127) bulletX = -1;
-      if (bulletX >= alienX - 2 && bulletX <= alienX + 8 &&
-          bulletY >= alienY - 5 && bulletY <= alienY + 5) {
+      if (bulletX >= alienX - 3 && bulletX <= alienX + 9 &&
+          bulletY >= alienY - 7 && bulletY <= alienY + 7) {
         spaceScore++;
         bulletX = -1;
-        alienX = 116;
-        alienY = random(18, 54);
+        if (spaceScore >= spaceTargetScore) {
+          spaceGameOver = true;
+          spacePlayerWon = true;
+        } else {
+          alienX = 116;
+          alienY = random(18, 54);
+          alienVelY = random(0, 2) == 0 ? -1 : 1;
+        }
       }
     }
 
     display.drawLine(0, 13, 127, 13, SSD1306_WHITE);
-    display.fillTriangle(6, shipY, 21, shipY - 6, 21, shipY + 6, SSD1306_WHITE);
+    if (now < spaceHitFlashUntilMs && ((now / 80UL) % 2UL) == 0) {
+      display.drawRect(1, 14, 126, 49, SSD1306_WHITE);
+    }
+    display.fillTriangle(6, shipY, 22, shipY - 6, 22, shipY + 6, SSD1306_WHITE);
+    display.drawLine(11, shipY - 8, 17, shipY - 2, SSD1306_WHITE);
+    display.drawLine(11, shipY + 8, 17, shipY + 2, SSD1306_WHITE);
     display.drawPixel(26, shipY - 2, SSD1306_WHITE);
     display.drawPixel(30, shipY + 3, SSD1306_WHITE);
-    display.fillCircle(alienX, alienY, 4, SSD1306_WHITE);
+    display.fillCircle(alienX, alienY, 5, SSD1306_WHITE);
+    display.drawFastHLine(alienX - 7, alienY, 15, SSD1306_WHITE);
     display.drawPixel(alienX - 2, alienY - 1, SSD1306_BLACK);
     display.drawPixel(alienX + 2, alienY - 1, SSD1306_BLACK);
     if (bulletX >= 0) display.drawFastHLine(bulletX, bulletY, 6, SSD1306_WHITE);
     display.setCursor(5, 3);
-    display.print("PESAWAT");
-    display.setCursor(91, 3);
+    display.print("L:");
+    display.print(spaceLives);
+    display.setCursor(47, 3);
+    display.print("ALIEN");
+    display.setCursor(94, 3);
     display.print("S:");
     display.print(spaceScore);
   }
@@ -3183,12 +3359,13 @@ void drawReminderMenu(unsigned long now) {
   } else if (reminder.active) {
     display.print(reminderMessage());
   } else if (reminderClockMode) {
-    display.print("Jam ");
-    if (reminderHour < 10) display.print("0");
-    display.print(reminderHour);
+    display.print(reminderSlotCount);
+    display.print(" alarm ");
+    if (reminderSlots[0].hour < 10) display.print("0");
+    display.print(reminderSlots[0].hour);
     display.print(":");
-    if (reminderMinute < 10) display.print("0");
-    display.print(reminderMinute);
+    if (reminderSlots[0].minute < 10) display.print("0");
+    display.print(reminderSlots[0].minute);
   } else if (reminder.nextAtMs > now) {
     unsigned long remainSec = (reminder.nextAtMs - now) / 1000UL;
     display.print("Berikutnya ");
