@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -65,6 +66,8 @@ const uint16_t TOUCH_DEBOUNCE_MS = 35;
 const uint16_t TOUCH_LONG_MS = 720;
 const uint16_t TOUCH_DOUBLE_TAP_MS = 330;
 const uint8_t REMINDER_TEXT_MAX = 32;
+const long GMT_OFFSET_SEC = 7L * 3600L;
+const int DAYLIGHT_OFFSET_SEC = 0;
 
 enum Mood : uint8_t {
   MOOD_IDLE = 0,
@@ -245,7 +248,12 @@ uint8_t touchMoodStep = 0;
 float hotThresholdC = TEMP_HOT_C;
 float coldThresholdC = TEMP_COLD_C;
 bool reminderEnabled = true;
+bool reminderClockMode = false;
+bool timeConfigured = false;
 uint8_t reminderIntervalIndex = 0;
+uint8_t reminderHour = 7;
+uint8_t reminderMinute = 30;
+int reminderLastYday = -1;
 bool wifiStarted = false;
 bool geminiActive = false;
 String geminiStatus = "AI OFF";
@@ -340,6 +348,7 @@ void showMinigameScreen(unsigned long now);
 void showFaceScreen();
 void toggleReminder(unsigned long now);
 void setReminderText(const char* text);
+void setReminderSchedule(const char* payload, unsigned long now);
 void startSelectedGame(unsigned long now);
 
 bool secretsConfigured() {
@@ -660,7 +669,12 @@ void scheduleReminder(unsigned long now, unsigned long delayMs) {
 
 void acknowledgeReminder(unsigned long now) {
   reminder.lastAckMs = now;
-  scheduleReminder(now, reminderIntervalMs());
+  if (reminderClockMode) {
+    reminder.active = false;
+    reminder.activeUntilMs = 0UL;
+  } else {
+    scheduleReminder(now, reminderIntervalMs());
+  }
 }
 
 void updateReminder(unsigned long now) {
@@ -668,6 +682,38 @@ void updateReminder(unsigned long now) {
     reminder.active = false;
     reminder.nextAtMs = 0UL;
     return;
+  }
+
+  if (reminderClockMode) {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo, 20)) {
+      return;
+    } else {
+      if (!reminder.active &&
+          timeinfo.tm_hour == reminderHour &&
+          timeinfo.tm_min == reminderMinute &&
+          timeinfo.tm_yday != reminderLastYday) {
+        reminder.active = true;
+        reminder.lastTriggeredMs = now;
+        reminder.activeUntilMs = now + REMINDER_VISIBLE_MS;
+        reminder.count++;
+        reminderLastYday = timeinfo.tm_yday;
+      }
+
+      if (reminder.active) {
+        bool acknowledgedByShake = sensors.lastShakeMs > reminder.lastTriggeredMs &&
+                                   now - sensors.lastShakeMs < 320UL;
+        if (acknowledgedByShake) {
+          acknowledgeReminder(now);
+          return;
+        }
+        if (now >= reminder.activeUntilMs) {
+          reminder.active = false;
+          reminder.activeUntilMs = 0UL;
+        }
+      }
+      return;
+    }
   }
 
   if (reminder.nextAtMs == 0UL) {
@@ -739,6 +785,11 @@ void updateWifi(unsigned long now) {
 
   if (WiFi.status() == WL_CONNECTED) {
     geminiActive = true;
+    if (!timeConfigured) {
+      configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org", "time.google.com", "id.pool.ntp.org");
+      timeConfigured = true;
+      Serial.println("NTP CONFIGURED GMT+7");
+    }
     if (!webIpShown) {
       webIpShown = true;
       Serial.print("WEB URL: http://");
@@ -926,13 +977,15 @@ void updateSerialFrame(unsigned long now) {
     if (serialReminderReceiving) {
       if (b == '\n' || b == '\r') {
         serialReminderBuffer[serialReminderIndex] = '\0';
-        setReminderText(serialReminderBuffer);
+        setReminderSchedule(serialReminderBuffer, now);
         serialReminderReceiving = false;
         Serial.print("REMINDER TEXT: ");
         Serial.println(reminderText);
-        reminder.active = true;
-        reminder.lastTriggeredMs = now;
-        reminder.activeUntilMs = now + REMINDER_VISIBLE_MS;
+        if (!reminderClockMode) {
+          reminder.active = true;
+          reminder.lastTriggeredMs = now;
+          reminder.activeUntilMs = now + REMINDER_VISIBLE_MS;
+        }
         continue;
       }
       if (serialReminderIndex < REMINDER_TEXT_MAX && b >= 32 && b <= 126) {
@@ -2383,6 +2436,35 @@ void setReminderText(const char* text) {
   }
 }
 
+void setReminderSchedule(const char* payload, unsigned long now) {
+  if (payload[0] >= '0' && payload[0] <= '2' &&
+      payload[1] >= '0' && payload[1] <= '9' &&
+      payload[2] == ':' &&
+      payload[3] >= '0' && payload[3] <= '5' &&
+      payload[4] >= '0' && payload[4] <= '9' &&
+      payload[5] == '|') {
+    uint8_t hh = (payload[0] - '0') * 10 + (payload[1] - '0');
+    uint8_t mm = (payload[3] - '0') * 10 + (payload[4] - '0');
+    if (hh < 24 && mm < 60) {
+      reminderHour = hh;
+      reminderMinute = mm;
+      reminderClockMode = true;
+      reminderEnabled = true;
+      reminder.active = false;
+      reminder.activeUntilMs = 0UL;
+      reminder.nextAtMs = 0UL;
+      reminderLastYday = -1;
+      setReminderText(payload + 6);
+      webCommand = "REMINDER JAM";
+      webCommandUntilMs = now + 900UL;
+      return;
+    }
+  }
+
+  reminderClockMode = false;
+  setReminderText(payload);
+}
+
 void drawCenteredTextLine(const char* text, int y, uint8_t size) {
   int width = strlen(text) * 6 * size;
   int x = (SCREEN_WIDTH - width) / 2;
@@ -3100,6 +3182,13 @@ void drawReminderMenu(unsigned long now) {
     display.print("Tidak ada alarm");
   } else if (reminder.active) {
     display.print(reminderMessage());
+  } else if (reminderClockMode) {
+    display.print("Jam ");
+    if (reminderHour < 10) display.print("0");
+    display.print(reminderHour);
+    display.print(":");
+    if (reminderMinute < 10) display.print("0");
+    display.print(reminderMinute);
   } else if (reminder.nextAtMs > now) {
     unsigned long remainSec = (reminder.nextAtMs - now) / 1000UL;
     display.print("Berikutnya ");
