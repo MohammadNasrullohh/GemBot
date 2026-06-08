@@ -25,7 +25,7 @@
 #define MAX_BCLK_PIN D0
 #define MAX_LRC_PIN D8
 #define MAX_DIN_PIN D7
-#define MIC_SD_PIN D1
+#define MIC_SD_PIN D10
 #define DHT_PIN D2
 #define DHT_TYPE DHT22
 #define TOUCH_PIN D3
@@ -93,6 +93,8 @@ float humPct = NAN;
 float tempMood = 0.0f;
 float humidMood = 0.0f;
 float shakeMeter = 0.0f;
+float spinSmooth = 0.0f;
+float spinMeter = 0.0f;
 bool angryMode = false;
 bool superAngryMode = false;       // triggered after sustained hard shaking
 unsigned long angryUntilMs = 0;
@@ -104,6 +106,12 @@ unsigned long shakeActiveStartMs = 0; // when continuous shaking started
 bool touchDown = false;
 bool lastTouchReading = false;
 unsigned long touchChangedMs = 0;
+unsigned long lastTouchDebounce = 0;
+
+// Chat State
+char chatText[256] = "";
+unsigned long chatStartMs = 0;
+unsigned long chatDisplayUntilMs = 0;
 unsigned long touchDownMs = 0;
 unsigned long lastTapMs = 0;
 unsigned long touchHappyUntilMs = 0;
@@ -169,24 +177,177 @@ unsigned long touchGameMs = 0;
 
 void initPingpong(bool resetScore = false); // Forward declaration for updateTouch
 
-struct FaceState {
-  float eyeW, eyeH, eyeR;
-  float eyeSpacing;
-  float browDrop, browAngle;
-  float mouthW, mouthH, mouthY, mouthCurve;
-  float cheekRise;
+// ─── TIMING ────────────────────────────────────────────────
+#define MORPH_STEPS      20   // jumlah frame per transisi
+#define HOLD_FRAMES     120   // frame tahan sebelum ganti emosi
+
+// ─── STRUCT EMOSI ──────────────────────────────────────────
+struct EyeParam {
+  int8_t cx, cy, rx, ry; // center x/y, radius x/y
+  int8_t lx;             // look x offset (pupil shift)
+  uint8_t type;          // 0=normal, 1=heart, 2=star, 3=X, 4=squint, 5=wink, 6=dollar, 7=note, 8=lightning
 };
 
-FaceState currentFace = {26.0f, 37.0f, 10.0f, 48.0f, 0.0f, 0.0f, 16.0f, 6.0f, 35.0f, 4.0f, 0.0f};
-FaceState targetFace = {26.0f, 37.0f, 10.0f, 48.0f, 0.0f, 0.0f, 16.0f, 6.0f, 35.0f, 4.0f, 0.0f};
+struct BrowParam {
+  int8_t x, y, w;        // start x, y, width
+  int8_t angle;          // sudut × 10 (contoh: 25 = 0.25 rad)
+};
+
+struct MouthParam {
+  int8_t x1, y1, x2, y2;// titik awal & akhir
+  int8_t dep;            // depth (kedalaman kurva)
+  int8_t cx, cy, rx, ry; // untuk oval/scream
+  uint8_t type;          // 0=line, 1=smile, 2=frown, 3=oval, 4=wavy, 5=smirk, 6=teeth, 7=scream, 8=zigzag
+};
+
+struct EmoParam {
+  const char* name;
+  EyeParam  eyeL, eyeR;
+  BrowParam browL, browR;
+  uint8_t   lid;   // kelopak mata × 10 (0–10)
+  MouthParam mouth;
+  bool      tearL, tearR;
+};
+
+const EmoParam EMOTIONS[] PROGMEM = {
+  // 0 NORMAL
+  {"NORMAL",
+    {41,31,11,14, 0,0}, {89,31,11,14, 0,0},
+    {30,17,20, 0}, {78,17,20, 0}, 0,
+    {52,50,76,50, 0, 0,0,0,0, 0}, false, false},
+  // 1 HAPPY
+  {"HAPPY",
+    {41,29,11,11, 0,0}, {89,29,11,11, 0,0},
+    {28,15,22,-2}, {80,15,22, 2}, 0,
+    {48,49,80,49, 8, 0,0,0,0, 1}, false, false},
+  // 2 SAD
+  {"SAD",
+    {41,33,11,12, 0,0}, {89,33,11,12, 0,0},
+    {28,18,22, 3}, {80,18,22,-3}, 2,
+    {50,53,78,53, 6, 0,0,0,0, 2}, false, false},
+  // 3 ANGRY
+  {"ANGRY",
+    {41,31,10,13, 0,0}, {89,31,10,13, 0,0},
+    {28,17,23, 4}, {79,17,23,-4}, 3,
+    {49,52,79,52, 4, 0,0,0,0, 2}, false, false},
+  // 4 LOVE
+  {"LOVE",
+    {41,30, 0, 0, 0,1}, {89,30, 0, 0, 0,1},
+    {28,15,22,-2}, {80,15,22, 2}, 0,
+    {48,49,80,49, 9, 0,0,0,0, 1}, false, false},
+  // 5 SURPRISED
+  {"SURPRISED",
+    {41,28,13,16, 0,0}, {89,28,13,16, 0,0},
+    {26,12,24,-1}, {80,12,24, 1}, 0,
+    { 0, 0, 0, 0, 0,64,51, 8, 7, 3}, false, false},
+  // 6 SLEEPY
+  {"SLEEPY",
+    {41,33,11, 8, 0,0}, {89,33,11, 8, 0,0},
+    {28,20,22, 1}, {80,20,22,-1}, 6,
+    {52,51,76,51, 0, 0,0,0,0, 0}, false, false},
+  // 7 EXCITED
+  {"EXCITED",
+    {41,29, 0, 0, 0,2}, {89,29, 0, 0, 0,2},
+    {26,13,24,-3}, {80,13,24, 3}, 0,
+    {46,49,82,49,10, 0,0,0,0, 1}, false, false},
+  // 8 SCARED
+  {"SCARED",
+    {38,30,13,15, 2,0}, {90,30,13,15,-2,0},
+    {25,13,24, 4}, {81,13,24,-4}, 0,
+    {50,54,78,54, 5, 0,0,0,0, 2}, false, false},
+  // 9 CONFUSED
+  {"CONFUSED",
+    {41,31,10,13, 0,0}, {89,30,11, 8, 0,4},
+    {27,17,22,-2}, {80,15,22, 4}, 0,
+    {50,51,78,51, 0, 0,0,0,0, 4}, false, false},
+  // 10 SMUG
+  {"SMUG",
+    {41,31,10,12, 1,0}, {89,31,10,12, 1,0},
+    {27,18,22, 1}, {80,16,22,-2}, 3,
+    {54,50,78,50, 0, 0,0,0,0, 5}, false, false},
+  // 11 DEAD
+  {"DEAD",
+    {41,30, 0, 0, 0,3}, {89,30, 0, 0, 0,3},
+    {28,18,22, 0}, {80,18,22, 0}, 0,
+    {50,52,78,52, 0, 0,0,0,0, 4}, false, false},
+  // 12 LAUGHING
+  {"LAUGHING",
+    {41,32,11, 6, 0,0}, {89,32,11, 6, 0,0},
+    {27,16,22,-2}, {81,16,22, 2}, 6,
+    {46,49,82,49,10, 0,0,0,0, 6}, false, false},
+  // 13 CRYING
+  {"CRYING",
+    {41,34,11,11, 0,0}, {89,34,11,11, 0,0},
+    {26,17,24, 4}, {80,17,24,-4}, 2,
+    {47,56,81,56, 8, 0,0,0,0, 2}, true, true},
+  // 14 WINK
+  {"WINK",
+    {41,30,11,13, 0,0}, {89,30, 0, 0, 0,5},
+    {28,16,22, 0}, {80,16,22,-1}, 0,
+    {54,49,78,49, 0, 0,0,0,0, 5}, false, false},
+  // 15 ROLLING EYES
+  {"ROLLING",
+    {41,31,11,13,-3,0}, {89,31,11,13,-3,0},
+    {28,17,22, 1}, {80,17,22,-1}, 4,
+    {52,52,76,52, 0, 0,0,0,0, 0}, false, false},
+  // 16 PAIN
+  {"PAIN",
+    {41,31,10,13, 0,0}, {89,31,10,13, 0,0},
+    {27,17,22, 5}, {81,17,22,-5}, 1,
+    {50,52,78,52, 0, 0,0,0,0, 8}, false, false},
+  // 17 GREEDY
+  {"GREEDY",
+    {41,30, 0, 0, 0,6}, {89,30, 0, 0, 0,6},
+    {27,16,22,-1}, {81,16,22, 1}, 0,
+    {48,49,80,49, 7, 0,0,0,0, 1}, false, false},
+  // 18 DIZZY
+  {"DIZZY",
+    {41,30, 0, 0, 0,7}, {89,30, 0, 0, 0,7},
+    {27,18,22, 1}, {81,18,22,-1}, 0,
+    {50,51,78,51, 0, 0,0,0,0, 4}, false, false},
+  // 19 RAGE
+  {"RAGE",
+    {41,31,10,12, 0,0}, {89,31,10,12, 0,0},
+    {27,16,23, 6}, {80,16,23,-6}, 4,
+    { 0, 0, 0, 0, 0,64,52, 9, 5, 7}, false, false},
+  // 20 MUSICAL
+  {"MUSICAL",
+    {38,30, 0, 0, 0,7}, {88,30, 0, 0, 0,7},
+    {28,15,22,-1}, {80,15,22, 1}, 0,
+    {50,49,78,49, 7, 0,0,0,0, 1}, false, false},
+  // 21 ELECTRIC
+  {"ELECTRIC",
+    {41,30, 0, 0, 0,8}, {89,30, 0, 0, 0,8},
+    {27,15,22,-2}, {81,15,22, 2}, 0,
+    {48,49,80,49, 6, 0,0,0,0, 1}, false, false},
+  // 22 BORED
+  {"BORED",
+    {41,33,11, 7, 0,0}, {89,33,11, 7, 0,0},
+    {29,21,20, 1}, {81,21,20,-1}, 7,
+    { 0, 0, 0, 0, 0,64,53, 5, 5, 3}, false, false},
+  // 23 PROUD
+  {"PROUD",
+    {41,30,11,13, 0,0}, {89,30,11,13, 0,0},
+    {27,14,24,-3}, {79,14,24, 3}, 2,
+    {50,50,78,50, 5, 0,0,0,0, 1}, false, false},
+};
+#define EMO_COUNT (sizeof(EMOTIONS) / sizeof(EMOTIONS[0]))
+
+uint8_t  currentEmo   = 0;
+uint8_t  targetEmo    = 1;
+int8_t   morphStep    = 0;
+bool     morphing     = false;
 
 
-enum AppState { STATE_FACE, STATE_MENU, STATE_GAMES, STATE_SENSOR, STATE_REMINDER };
+enum AppState { STATE_FACE, STATE_MENU, STATE_GAMES, STATE_SENSOR, STATE_REMINDER, STATE_DRAW, STATE_MUSIC, STATE_CHAT };
 AppState currentState = STATE_FACE;
 bool req_lovestory = false;
+uint8_t req_song = 0;
 int menuCursor = 0;
+int musicCursor = 0;
 int gameCursor = 0;
 char globalReminderText[64] = "Belum ada reminder";
+uint8_t drawFrame[1024];
 
 uint8_t audioRing[AUDIO_RING_SIZE];
 uint16_t ringHead = 0;
@@ -336,6 +497,7 @@ void setupDHT() {
 // Forward declarations needed for updateTouch()
 void initMonsterBattle();
 void playerAttack();
+void enterDrawMode(bool clearCanvas);
 
 void updateTouch() {
   unsigned long now = millis();
@@ -350,42 +512,51 @@ void updateTouch() {
   touchDown = reading;
   if (touchDown) {
     touchDownMs = now;
+    // Instantly go to menu on touch
+    if (currentState == STATE_FACE) {
+      currentState = STATE_MENU;
+      menuCursor = 0;
+    }
     return;
   }
 
   unsigned long held = now - touchDownMs;
 
   if (currentState == STATE_FACE) {
-    if (held > 2000UL) {
-      touchSleepyUntilMs = now + 2600UL;
-      touchHappyUntilMs = 0;
-      touchLoveUntilMs = 0;
-      Serial.println("touch hold -> sleepy");
-    } else if (now - lastTapMs < 430UL) {
-      laughUntilMs = now + 2500UL; // Double tap -> Laugh
-      touchLoveUntilMs = 0;
-      touchHappyUntilMs = 0;
-      lastTapMs = 0;
-      Serial.println("touch double -> laugh");
-    } else {
-      lastTapMs = now;
-      if (held < 500UL) {
-        currentState = STATE_MENU;
-        menuCursor = 0;
-      }
-    }
+    // Already handled in touchDown above
   } else if (currentState == STATE_MENU) {
     if (held > 600UL) {
       if (menuCursor == 0) currentState = STATE_GAMES;
       else if (menuCursor == 1) currentState = STATE_SENSOR;
       else if (menuCursor == 2) currentState = STATE_REMINDER;
       else if (menuCursor == 3) {
+        currentState = STATE_MUSIC;
+        musicCursor = 0;
+      }
+      else if (menuCursor == 4) enterDrawMode(true);
+      else if (menuCursor == 5) currentState = STATE_FACE;
+      if (currentState == STATE_GAMES) gamePhase = GAME_IDLE;
+    } else {
+      menuCursor = (menuCursor + 1) % 6;
+    }
+  } else if (currentState == STATE_MUSIC) {
+    if (held > 600UL) {
+      if (musicCursor == 0) {
         currentState = STATE_FACE;
         req_lovestory = true;
+        req_song = 1;
+      } else if (musicCursor == 1) {
+        currentState = STATE_FACE;
+        req_song = 2;
+      } else if (musicCursor == 2) {
+        currentState = STATE_FACE;
+        req_song = 3;
+      } else {
+        currentState = STATE_MENU;
+        menuCursor = 3;
       }
-      else if (menuCursor == 4) currentState = STATE_FACE;
     } else {
-      menuCursor = (menuCursor + 1) % 5;
+      musicCursor = (musicCursor + 1) % 4;
     }
   } else if (currentState == STATE_GAMES) {
     if (held > 600UL) {
@@ -403,7 +574,7 @@ void updateTouch() {
         }
       }
     }
-  } else if (currentState == STATE_SENSOR || currentState == STATE_REMINDER) {
+  } else if (currentState == STATE_SENSOR || currentState == STATE_REMINDER || currentState == STATE_DRAW || currentState == STATE_CHAT) {
     if (held > 600UL) {
       currentState = STATE_FACE;
     } else {
@@ -481,10 +652,13 @@ void updateMPU() {
 
   // Only use jerk for shake — gyro causes false positives from I2C noise
   float targetShake = clampFloat(jerk * 0.10f, 0.0f, 1.0f);
+  float gyroMag = fabsf(gx) + fabsf(gy) + fabsf(gz);
+  float targetSpin = gyroMag > 1.65f ? clampFloat((gyroMag - 1.65f) * 0.22f, 0.0f, 1.0f) : 0.0f;
 
   tiltX += (targetTiltX - tiltX) * 0.18f;
   tiltY += (targetTiltY - tiltY) * 0.18f;
   shakeSmooth = shakeSmooth * 0.80f + targetShake * 0.20f;
+  spinSmooth = spinSmooth * 0.82f + targetSpin * 0.18f;
 
   if (targetShake > 0.0f) {
     shakeMeter += targetShake * 0.05f;
@@ -492,6 +666,20 @@ void updateMPU() {
     shakeMeter -= 0.04f;  // Fast decay — returns to calm quickly
   }
   shakeMeter = clampFloat(shakeMeter, 0.0f, 1.0f);
+
+  if (targetSpin > 0.05f) {
+    spinMeter += targetSpin * 0.045f;
+  } else {
+    spinMeter -= 0.035f;
+  }
+  spinMeter = clampFloat(spinMeter, 0.0f, 1.0f);
+
+  // Continuous rotation should feel like dizziness, not anger.
+  if (spinMeter > 0.72f) {
+    dizzyUntilMs = now + 2600UL;
+  } else if (spinMeter > 0.42f) {
+    dizzyUntilMs = now + 1400UL;
+  }
 
   // Very high thresholds — only extreme continuous shaking triggers angry
   if (shakeMeter > 0.95f) {
@@ -596,7 +784,7 @@ void sendTelemetry() {
   else if (now < touchLoveUntilMs) { exprName = "SAYANG"; speech = "<3"; }
   else if (now < touchHappyUntilMs) { exprName = "SENANG"; speech = "HEH~"; }
   else if (now < annoyedUntilMs) { exprName = "KESAL"; speech = "ISH.."; }
-  else if (now < touchSleepyUntilMs || (touchDown && (now - touchDownMs > 2000UL))) { exprName = "NGANTUK"; speech = "zzz"; }
+  else if (now < touchSleepyUntilMs) { exprName = "NGANTUK"; speech = "zzz"; }
   else if (now < micShoutUntilMs) { exprName = "TERIAKAN"; speech = "HEI!"; }
   else if (playing) { exprName = "MUSIK"; speech = "~LA~"; }
   else if (faceDownMode) { exprName = "SEDIH"; speech = "HMM.."; }
@@ -611,7 +799,7 @@ void sendTelemetry() {
     "\"game\":%d,\"scoreP\":%d,\"scoreA\":%d,"
     "\"laugh\":%d,\"glitch\":%d,\"pant\":%d,\"cry\":%d,\"sleep\":%d,"
     "\"dizzy\":%d,\"sad\":%d,\"annoyed\":%d,\"love\":%d,"
-    "\"inmp\":%d,\"max\":%d,\"req_lovestory\":%d,"
+    "\"inmp\":%d,\"inmpPeak\":%d,\"micActive\":%d,\"max\":%d,\"req_lovestory\":%d,\"req_song\":%d,"
     "\"state\":%d,"
     "\"expr\":\"%s\""
     "}",
@@ -632,17 +820,19 @@ void sendTelemetry() {
     (now < glitchUntilMs) ? 1 : 0,
     (now < pantUntilMs) ? 1 : 0,
     (now < cryUntilMs) ? 1 : 0,
-    (now < touchSleepyUntilMs || (touchDown && (now - touchDownMs > 2000UL))) ? 1 : 0,
+    (now < touchSleepyUntilMs) ? 1 : 0,
     (now < dizzyUntilMs) ? 1 : 0,
     (now < sadUntilMs) ? 1 : 0,
     (now < annoyedUntilMs) ? 1 : 0,
     (now < touchLoveUntilMs) ? 1 : 0,
-    (int)(levelSmooth * 100), playing ? 1 : 0, req_lovestory ? 1 : 0,
+    (int)(micSmooth * 100), (int)(micPeak * 100), (now < micActiveUntilMs) ? 1 : 0,
+    playing ? 1 : 0, req_lovestory ? 1 : 0, (int)req_song,
     (int)currentState,
     exprName
   );
 
   if (req_lovestory) req_lovestory = false;
+  req_song = 0;
 
   telemetryUdp.beginPacket(IPAddress(255, 255, 255, 255), TELEMETRY_PORT);
   telemetryUdp.write((const uint8_t*)telemetryJson, strlen(telemetryJson));
@@ -701,250 +891,1087 @@ void drawStatus(const char* title, const char* line1, const char* line2 = "") {
   display.display();
 }
 
-void drawMochiSmile(int cx, int y, int w, int depth) {
-  for (int i = 0; i <= w; i++) {
-    float t = (float)i / (float)w;
-    float arc = 4.0f * t * (1.0f - t);
-    int x = cx - w / 2 + i;
-    int yy = y + (int)(arc * depth);
-    display.fillCircle(x, yy, 1, OLED_WHITE);
-  }
-  display.fillCircle(cx - w / 2, y - 1, 1, OLED_WHITE);
-  display.fillCircle(cx + w / 2, y - 1, 1, OLED_WHITE);
+// Legacy drawing helpers removed.
+
+// ─── UTIL: integer lerp ────────────────────────────────────
+int16_t lerpI(int16_t a, int16_t b, uint8_t step, uint8_t total) {
+  return a + ((int32_t)(b - a) * step) / total;
 }
 
-void drawTinyHeart(int hx, int hy) {
-  display.fillCircle(hx - 2, hy, 2, OLED_WHITE);
-  display.fillCircle(hx + 2, hy, 2, OLED_WHITE);
-  display.fillTriangle(hx - 5, hy + 1, hx + 5, hy + 1, hx, hy + 7, OLED_WHITE);
-}
+// ─── CUSTOM ELLIPSE DRAWING ────────────────────────────────
+void drawEllipseLocal(int16_t x0, int16_t y0, int16_t rx, int16_t ry, uint16_t color) {
+  int a2 = rx * rx;
+  int b2 = ry * ry;
+  int fa2 = 4 * a2, fb2 = 4 * b2;
+  int x, y, sigma;
 
-void drawSweatDrop(int x, int y) {
-  display.fillCircle(x, y + 7, 3, OLED_WHITE);
-  display.fillTriangle(x - 2, y + 5, x + 2, y + 5, x, y, OLED_WHITE);
-}
-
-void drawSpark(int sx, int sy, int size) {
-  display.drawPixel(sx, sy, OLED_WHITE);
-  for (int i = 1; i <= size; i++) {
-    display.drawPixel(sx, sy - i, OLED_WHITE);
-    display.drawPixel(sx, sy + i, OLED_WHITE);
-    display.drawPixel(sx - i, sy, OLED_WHITE);
-    display.drawPixel(sx + i, sy, OLED_WHITE);
-  }
-}
-
-void drawHappyEye(int cx, int cy, int w) {
-  int half = w / 2;
-  for (int t = 0; t < 3; t++) {
-    for (int x = -half; x <= half; x++) {
-      float n = (float)x / (float)half;
-      int y = cy + (int)((1.0f - n * n) * 6.0f) + t;
-      display.drawPixel(cx + x, y, OLED_WHITE);
+  for (x = 0, y = ry, sigma = 2*b2+a2*(1-2*ry); b2*x <= a2*y; x++) {
+    display.drawPixel(x0 + x, y0 + y, color);
+    display.drawPixel(x0 - x, y0 + y, color);
+    display.drawPixel(x0 + x, y0 - y, color);
+    display.drawPixel(x0 - x, y0 - y, color);
+    if (sigma >= 0) {
+      sigma += fa2 * (1 - y);
+      y--;
     }
+    sigma += b2 * ((4 * x) + 6);
+  }
+  for (x = rx, y = 0, sigma = 2*a2+b2*(1-2*rx); a2*y <= b2*x; y++) {
+    display.drawPixel(x0 + x, y0 + y, color);
+    display.drawPixel(x0 - x, y0 + y, color);
+    display.drawPixel(x0 + x, y0 - y, color);
+    display.drawPixel(x0 - x, y0 - y, color);
+    if (sigma >= 0) {
+      sigma += fb2 * (1 - x);
+      x--;
+    }
+    sigma += a2 * ((4 * y) + 6);
   }
 }
 
-void drawSleepyEye(int x, int y, int w) {
-  display.fillRoundRect(x, y + 13, w, 6, 3, OLED_WHITE);
-}
+void fillEllipseLocal(int16_t x0, int16_t y0, int16_t rx, int16_t ry, uint16_t color) {
+  int a2 = rx * rx;
+  int b2 = ry * ry;
+  int fa2 = 4 * a2, fb2 = 4 * b2;
+  int x, y, sigma;
 
-void drawDizzyEye(int cx, int cy) {
-  display.drawCircle(cx, cy, 7, OLED_WHITE);
-  display.drawCircle(cx + 1, cy, 4, OLED_WHITE);
-  display.drawPixel(cx - 2, cy - 1, OLED_WHITE);
-  display.drawPixel(cx + 3, cy + 2, OLED_WHITE);
-}
-
-void drawShiverMarks(int x, int y) {
-  display.drawLine(x, y, x + 3, y + 3, OLED_WHITE);
-  display.drawLine(x + 3, y + 3, x, y + 6, OLED_WHITE);
-  display.drawLine(x + 7, y + 1, x + 10, y + 4, OLED_WHITE);
-  display.drawLine(x + 10, y + 4, x + 7, y + 7, OLED_WHITE);
-}
-
-void drawAngerMark(int x, int y) {
-  display.drawLine(x, y, x + 5, y + 5, OLED_WHITE);
-  display.drawLine(x + 5, y, x, y + 5, OLED_WHITE);
-  display.drawLine(x + 1, y, x + 6, y + 5, OLED_WHITE);
-  display.drawLine(x + 6, y, x + 1, y + 5, OLED_WHITE);
-}
-
-void drawBlushLines(int cx, int cy) {
-  for (int i = 0; i < 3; i++) {
-    int x = cx - 5 + i * 4;
-    display.drawLine(x, cy + 2, x + 2, cy, OLED_WHITE);
+  for (x = 0, y = ry, sigma = 2*b2+a2*(1-2*ry); b2*x <= a2*y; x++) {
+    display.drawLine(x0 - x, y0 + y, x0 + x, y0 + y, color);
+    display.drawLine(x0 - x, y0 - y, x0 + x, y0 - y, color);
+    if (sigma >= 0) {
+      sigma += fa2 * (1 - y);
+      y--;
+    }
+    sigma += b2 * ((4 * x) + 6);
+  }
+  for (x = rx, y = 0, sigma = 2*a2+b2*(1-2*rx); a2*y <= b2*x; y++) {
+    display.drawLine(x0 - x, y0 + y, x0 + x, y0 + y, color);
+    display.drawLine(x0 - x, y0 - y, x0 + x, y0 - y, color);
+    if (sigma >= 0) {
+      sigma += fb2 * (1 - x);
+      x--;
+    }
+    sigma += a2 * ((4 * y) + 6);
   }
 }
 
-void drawDasaiMouth(int cx, int y) {
-  display.drawBitmap(cx - 8, y, img_normal_mouth, 16, 6, OLED_WHITE);
-}
-
-void drawCrossEye(int cx, int cy, int size) {
-  for (int i = -2; i <= 2; i++) {
-    display.drawLine(cx - size + i, cy - size, cx + size + i, cy + size, OLED_WHITE);
-    display.drawLine(cx - size + i, cy + size, cx + size + i, cy - size, OLED_WHITE);
+// ─── PRIMITIVE DRAWING FUNCTIONS ───────────────────────────
+void drawBrow(int16_t x, int16_t y, int16_t w, int16_t angleX10, int dx, int dy) {
+  float angle = angleX10 / 10.0f;
+  int16_t cx = x + w / 2, cy = y;
+  for (int16_t i = 0; i < w; i++) {
+    float t = (float)i / (w - 1) - 0.5f;
+    int16_t bx = cx + (int16_t)(t * w) + dx;
+    int16_t by = cy + (int16_t)(t * w * angle) + dy;
+    display.drawPixel(bx, by,     OLED_WHITE);
+    display.drawPixel(bx, by + 1, OLED_WHITE);
   }
 }
 
-void drawHollowEye(int cx, int cy, int rx, int ry) {
-  for (int i = 0; i < 3; i++) {
-    display.drawRoundRect(cx - rx + i, cy - ry + i, (rx-i)*2, (ry-i)*2, 6, OLED_WHITE);
-  }
-}
-
-void drawCaretEye(int cx, int cy, int size) {
-  for (int i = 0; i < 3; i++) {
-    display.drawLine(cx - size, cy + i, cx, cy - size + i, OLED_WHITE);
-    display.drawLine(cx, cy - size + i, cx + size, cy + i, OLED_WHITE);
-  }
-}
-
-void drawTTEye(int cx, int cy, int w, int h) {
-  display.fillRect(cx - w/2, cy - h/2, w, 4, OLED_WHITE);
-  display.fillRect(cx - 2, cy - h/2, 4, h, OLED_WHITE);
-}
-
-void drawDashEye(int cx, int cy, int w) {
-  display.fillRect(cx - w/2, cy - 2, w, 4, OLED_WHITE);
-}
-
-void drawAngryLineEye(int cx, int cy, int w, int h, bool left) {
-  for (int i = -1; i <= 2; i++) {
-    if (left) display.drawLine(cx - w/2 + i, cy - h/2, cx + w/2 + i, cy + h/2, OLED_WHITE);
-    else display.drawLine(cx - w/2 + i, cy + h/2, cx + w/2 + i, cy - h/2, OLED_WHITE);
-  }
-}
-
-void drawSoftBrows(int leftX, int rightX, int y, int w, int style) {
-  int lx1 = leftX + 1;
-  int lx2 = leftX + w - 1;
-  int rx1 = rightX + 1;
-  int rx2 = rightX + w - 1;
-  if (style == 1) {
-    display.drawLine(lx1, y + 4, lx2, y, OLED_WHITE);
-    display.drawLine(rx1, y, rx2, y + 4, OLED_WHITE);
-  } else if (style == 2) {
-    display.drawLine(lx1, y, lx2, y + 3, OLED_WHITE);
-    display.drawLine(rx1, y + 3, rx2, y, OLED_WHITE);
-  } else if (style == 3) {
-    display.drawLine(lx1, y + 2, lx2, y + 1, OLED_WHITE);
-    display.drawLine(rx1, y + 1, rx2, y + 2, OLED_WHITE);
-  }
-}
-
-void drawCatEars(int cx, int topY, int lean, bool wiggle, float amount) {
-  unsigned long now = millis();
-  int w = wiggle ? (int)(sinf(now * 0.009f) * amount * 3.0f) : 0;
-  int lx = cx - 30 + lean;
-  int rx = cx + 30 + lean;
-  display.drawTriangle(lx - 4, topY + 7, lx + 5, topY + 7, lx + w, topY - 4, OLED_WHITE);
-  display.drawTriangle(rx - 5, topY + 7, rx + 4, topY + 7, rx - w, topY - 4, OLED_WHITE);
-}
-
-void drawPupils(int lx, int rx, int ly, int ry, int w, int lh, int rh, int lookX, int lookY) {
-  int pupilR = 3;
-  int maxPX = w / 2 - pupilR - 2;
-  int maxPYL = lh / 2 - pupilR - 2;
-  int maxPYR = rh / 2 - pupilR - 2;
-  if (maxPX < 1) maxPX = 1;
-  if (maxPYL < 1) maxPYL = 1;
-  if (maxPYR < 1) maxPYR = 1;
-  int px = (int)clampFloat(lookX * 0.35f, -(float)maxPX, (float)maxPX);
-  int pyL = (int)clampFloat(lookY * 0.5f, -(float)maxPYL, (float)maxPYL);
-  int pyR = (int)clampFloat(lookY * 0.5f, -(float)maxPYR, (float)maxPYR);
-  display.fillCircle(lx + w / 2 + px, ly + lh / 2 + pyL, pupilR, OLED_BLACK);
-  display.drawPixel(lx + w / 2 + px - 1, ly + lh / 2 + pyL - 1, OLED_WHITE);
-  display.fillCircle(rx + w / 2 + px, ry + rh / 2 + pyR, pupilR, OLED_BLACK);
-  display.drawPixel(rx + w / 2 + px - 1, ry + rh / 2 + pyR - 1, OLED_WHITE);
-}
-
-void drawHeartEye(int cx, int cy, int sz) {
-  int r = sz > 6 ? sz / 3 : 2;
-  display.fillCircle(cx - r, cy - r / 2, r, OLED_WHITE);
-  display.fillCircle(cx + r, cy - r / 2, r, OLED_WHITE);
-  display.fillTriangle(cx - r * 2, cy, cx + r * 2, cy, cx, cy + r * 2, OLED_WHITE);
-}
-
-void drawFloatingNote(int x, int y, bool beamed) {
-  display.drawFastVLine(x + 3, y, 9, OLED_WHITE);
-  display.fillCircle(x + 1, y + 9, 2, OLED_WHITE);
-  if (beamed) {
-    display.drawFastVLine(x + 8, y + 2, 7, OLED_WHITE);
-    display.fillCircle(x + 6, y + 9, 2, OLED_WHITE);
-    display.drawFastHLine(x + 3, y, 5, OLED_WHITE);
-    display.drawFastHLine(x + 3, y + 2, 5, OLED_WHITE);
-  }
-}
-
-void drawZzz(int x, int y) {
-  unsigned long now = millis();
-  int d = (int)(sinf(now * 0.002f) * 2.0f);
-  display.setTextSize(1);
-  display.setTextColor(OLED_WHITE);
-  display.setCursor(x + d, y);
-  display.print("z");
-  display.setCursor(x + 5 + (int)((float)d * 0.7f), y - 7);
-  display.print("z");
-  display.setCursor(x + 9 + (int)((float)d * 0.5f), y - 12);
-  display.print("Z");
-}
-
-void drawBlushDots(int cx, int cy) {
-  for (int i = 0; i < 3; i++) {
-    display.drawPixel(cx - 4 + i * 3, cy, OLED_WHITE);
-    display.drawPixel(cx - 3 + i * 3, cy + 1, OLED_WHITE);
-  }
-}
-
-void drawMochiTinyMouth(int cx, int y, bool active) {
-  float voice = levelSmooth;
-  if (!active || voice < 0.10f) {
-    drawMochiSmile(cx, y, 25, 6);
+void drawEyeNormal(int16_t cx, int16_t cy, int16_t rx, int16_t ry,
+                   int16_t lookX, uint8_t lid, bool blink, int dx, int dy, int gLookX, int gLookY) {
+  cx += dx; cy += dy;
+  if (blink) {
+    for (int16_t x = cx - rx; x <= cx + rx; x++) {
+      display.drawPixel(x, cy,     OLED_WHITE);
+      display.drawPixel(x, cy + 1, OLED_WHITE);
+    }
     return;
   }
+  for (int16_t y = cy - ry; y <= cy + ry; y++) {
+    for (int16_t x = cx - rx; x <= cx + rx; x++) {
+      float fdx = (float)(x - cx) / rx;
+      float fdy = (float)(y - cy) / ry;
+      if (fdx * fdx + fdy * fdy <= 1.0f)
+        display.drawPixel(x, y, OLED_WHITE);
+    }
+  }
+  int16_t ps = min(rx, ry) * 45 / 100;
+  int16_t pcx = cx + lookX + gLookX, pcy = cy + gLookY;
+  for (int16_t y = pcy - ps; y <= pcy + ps; y++) {
+    for (int16_t x = pcx - ps; x <= pcx + ps; x++) {
+      float fdx = (float)(x - pcx) / ps;
+      float fdy = (float)(y - pcy) / ps;
+      if (fdx * fdx + fdy * fdy <= 1.0f)
+        display.drawPixel(x, y, OLED_BLACK);
+    }
+  }
+  display.drawPixel(pcx - ps / 3, pcy - ps / 3, OLED_WHITE);
+  if (lid > 0) {
+    int16_t lidH = (ry * 2 * lid) / 10;
+    int16_t yTop = cy - ry;
+    for (int16_t y = yTop; y < yTop + lidH; y++)
+      for (int16_t x = cx - rx - 1; x <= cx + rx + 1; x++)
+        display.drawPixel(x, y, OLED_BLACK);
+  }
+}
 
-  int smileW = 24 + (int)(voice * 8.0f);
-  int smileD = 5 + (int)(voice * 4.0f);
-  if (smileW > 32) smileW = 32;
-  if (smileD > 9) smileD = 9;
-  int syllable = (millis() / 145UL) % 4UL;
-  drawMochiSmile(cx, y - 1 + (syllable == 1 ? 1 : 0), smileW, smileD);
-
-  if (voice > 0.28f) {
-    int open = 2 + (int)(voice * 6.0f);
-    if (open > 8) open = 8;
-    int ow = syllable == 2 ? 10 : 8;
-    display.fillRoundRect(cx - ow / 2, y + 4, ow, open, 3, OLED_WHITE);
-    if (open > 4) {
-      display.fillRoundRect(cx - ow / 2 + 2, y + 6, ow - 4, open - 3, 2, OLED_BLACK);
+void drawHeart(int16_t cx, int16_t cy, int16_t sz, int dx, int dy) {
+  cx += dx; cy += dy;
+  for (int16_t y = -sz; y <= sz; y++) {
+    for (int16_t x = -sz; x <= sz; x++) {
+      float nx = (float)x / sz, ny = (float)y / sz;
+      float v = pow(nx*nx + ny*ny - 1.0f, 3) - nx*nx*ny*ny*ny;
+      if (v <= 0.0f) display.drawPixel(cx + x, cy + y - sz/10, OLED_WHITE);
     }
   }
 }
 
-void drawSurprisedMouth(int cx, int y) {
-  display.drawCircle(cx, y + 3, 5, OLED_WHITE);
-  display.drawCircle(cx, y + 3, 4, OLED_WHITE);
-}
-
-void drawWavyMouth(int cx, int y) {
-  unsigned long now = millis();
-  for (int i = -8; i <= 8; i++) {
-    float wave = sinf((float)i * 0.4f + now * 0.008f) * 1.5f;
-    display.drawPixel(cx + i, y + (int)wave, OLED_WHITE);
-    display.drawPixel(cx + i, y + (int)wave + 1, OLED_WHITE);
+void drawStar(int16_t cx, int16_t cy, int16_t sz, int dx, int dy) {
+  cx += dx; cy += dy;
+  for (uint8_t i = 0; i < 10; i++) {
+    float a0 = i * PI / 5.0f - PI / 2.0f;
+    float a1 = (i + 1) * PI / 5.0f - PI / 2.0f;
+    float r0 = (i % 2 == 0) ? sz : sz * 0.4f;
+    float r1 = (i % 2 == 0) ? sz * 0.4f : sz;
+    int16_t x0 = cx + (int16_t)(cos(a0) * r0);
+    int16_t y0 = cy + (int16_t)(sin(a0) * r0);
+    int16_t x1 = cx + (int16_t)(cos(a1) * r1);
+    int16_t y1 = cy + (int16_t)(sin(a1) * r1);
+    display.drawLine(x0, y0, x1, y1, OLED_WHITE);
   }
 }
 
-void drawPoutMouth(int cx, int y) {
-  display.fillRoundRect(cx - 4, y, 8, 5, 2, OLED_WHITE);
-  display.fillRoundRect(cx - 2, y + 1, 4, 3, 1, OLED_BLACK);
+void drawXEyes(int16_t cx, int16_t cy, int16_t sz, int dx, int dy) {
+  cx += dx; cy += dy;
+  display.drawLine(cx - sz, cy - sz, cx + sz, cy + sz, OLED_WHITE);
+  display.drawLine(cx - sz, cy + sz, cx + sz, cy - sz, OLED_WHITE);
+  display.drawLine(cx - sz + 1, cy - sz, cx + sz + 1, cy + sz, OLED_WHITE);
+  display.drawLine(cx - sz + 1, cy + sz, cx + sz + 1, cy - sz, OLED_WHITE);
+}
+
+void drawSquint(int16_t cx, int16_t cy, int16_t rx, int16_t ry, int dx, int dy) {
+  cx += dx; cy += dy;
+  for (int16_t y = cy - ry; y <= cy - ry / 2; y++) {
+    for (int16_t x = cx - rx; x <= cx + rx; x++) {
+      float fdx = (float)(x - cx) / rx;
+      float fdy = (float)(y - cy) / ry;
+      if (fdx*fdx + fdy*fdy <= 1.0f) display.drawPixel(x, y, OLED_WHITE);
+    }
+  }
+  for (int16_t x = cx - rx; x <= cx + rx; x++) display.drawPixel(x, cy + ry / 3, OLED_WHITE);
+}
+
+void drawWink(int16_t cx, int16_t cy, int dx, int dy) {
+  cx += dx; cy += dy;
+  display.drawLine(cx - 11, cy + 1, cx + 11, cy + 1, OLED_WHITE);
+  display.drawLine(cx - 11, cy + 2, cx + 11, cy + 2, OLED_WHITE);
+}
+
+void drawDollarSign(int16_t cx, int16_t cy, int16_t sz, int dx, int dy) {
+  cx += dx; cy += dy;
+  display.drawCircle(cx, cy, sz / 2, OLED_WHITE);
+  display.drawLine(cx, cy - sz, cx, cy + sz, OLED_WHITE);
+  display.drawLine(cx + 1, cy - sz, cx + 1, cy + sz, OLED_WHITE);
+}
+
+void drawSpiral(int16_t cx, int16_t cy, int16_t sz, int dx, int dy) {
+  cx += dx; cy += dy;
+  float prev_x = cx, prev_y = cy;
+  for (float a = 0; a < TWO_PI * 3; a += 0.2f) {
+    float r = sz * (a / (TWO_PI * 3));
+    int16_t nx = cx + (int16_t)(cos(a) * r);
+    int16_t ny = cy + (int16_t)(sin(a) * r);
+    display.drawLine(prev_x, prev_y, nx, ny, OLED_WHITE);
+    prev_x = nx; prev_y = ny;
+  }
+}
+
+void drawLightning(int16_t cx, int16_t cy, int16_t sz, int dx, int dy) {
+  cx += dx; cy += dy;
+  display.drawLine(cx,        cy - sz,    cx + sz/2, cy,       OLED_WHITE);
+  display.drawLine(cx + sz/2, cy,         cx,        cy + sz/4, OLED_WHITE);
+  display.drawLine(cx,        cy + sz/4,  cx + sz/2, cy + sz,  OLED_WHITE);
+}
+
+void drawEyeDispatch(EyeParam ep, uint8_t lid, bool blink, int dx, int dy, int lookX, int lookY) {
+  switch (ep.type) {
+    case 0: drawEyeNormal(ep.cx, ep.cy, ep.rx, ep.ry, ep.lx, lid, blink, dx, dy, lookX, lookY); break;
+    case 1: drawHeart(ep.cx, ep.cy, 10, dx, dy); break;
+    case 2: drawStar(ep.cx, ep.cy, 11, dx, dy); break;
+    case 3: drawXEyes(ep.cx, ep.cy, 10, dx, dy); break;
+    case 4: drawSquint(ep.cx, ep.cy, ep.rx, ep.ry, dx, dy); break;
+    case 5: drawWink(ep.cx, ep.cy, dx, dy); break;
+    case 6: drawDollarSign(ep.cx, ep.cy, 10, dx, dy); break;
+    case 7: drawSpiral(ep.cx, ep.cy, 9, dx, dy); break;
+    case 8: drawLightning(ep.cx, ep.cy, 9, dx, dy); break;
+  }
+}
+
+void drawMouth(MouthParam m, int dx, int dy) {
+  int16_t x1 = m.x1 + dx, y1 = m.y1 + dy;
+  int16_t x2 = m.x2 + dx, y2 = m.y2 + dy;
+  int16_t mx = (x1 + x2) / 2;
+  int16_t cx = m.cx + dx, cy = m.cy + dy;
+
+  switch (m.type) {
+    case 0: // line
+      display.drawLine(x1, y1, x2, y1, OLED_WHITE);
+      display.drawLine(x1, y1 + 1, x2, y1 + 1, OLED_WHITE);
+      break;
+    case 1: // smile
+    case 2: { // frown
+      int8_t dir = (m.type == 1) ? 1 : -1;
+      int16_t prevX = x1, prevY = y1;
+      for (uint8_t i = 1; i <= 20; i++) {
+        float t = i / 20.0f;
+        int16_t bx = (int16_t)((1-t)*(1-t)*x1 + 2*(1-t)*t*mx + t*t*x2);
+        int16_t by = (int16_t)((1-t)*(1-t)*y1 + 2*(1-t)*t*(y1 + dir*m.dep) + t*t*y2);
+        display.drawLine(prevX, prevY, bx, by, OLED_WHITE);
+        prevX = bx; prevY = by;
+      }
+      break;
+    }
+    case 3: // oval
+      drawEllipseLocal(cx, cy, m.rx, m.ry, OLED_WHITE);
+      break;
+    case 4: // wavy
+      for (int16_t x = x1; x <= x2; x++) {
+        float t = (float)(x - x1) / (x2 - x1);
+        int16_t wy = y1 + (int16_t)(sin(t * PI * 3) * 2);
+        display.drawPixel(x, wy, OLED_WHITE);
+        display.drawPixel(x, wy + 1, OLED_WHITE);
+      }
+      break;
+    case 5: { // smirk
+      int16_t prevX = x1, prevY = y1 + 2;
+      for (uint8_t i = 1; i <= 20; i++) {
+        float t = i / 20.0f;
+        int16_t bx = (int16_t)((1-t)*(1-t)*x1 + 2*(1-t)*t*(mx+8) + t*t*x2);
+        int16_t by = (int16_t)((1-t)*(1-t)*(y1+2) + 2*(1-t)*t*(y1+5) + t*t*y2);
+        display.drawLine(prevX, prevY, bx, by, OLED_WHITE);
+        prevX = bx; prevY = by;
+      }
+      break;
+    }
+    case 6: { // teeth
+      int16_t prevX = x1, prevY = y1;
+      for (uint8_t i = 1; i <= 20; i++) {
+        float t = i / 20.0f;
+        int16_t bx = (int16_t)((1-t)*(1-t)*x1 + 2*(1-t)*t*mx + t*t*x2);
+        int16_t by = (int16_t)((1-t)*(1-t)*y1 + 2*(1-t)*t*(y1+m.dep) + t*t*y2);
+        display.drawLine(prevX, prevY, bx, by, OLED_WHITE);
+        prevX = bx; prevY = by;
+      }
+      uint8_t tw = x2 - x1 - 4;
+      for (uint8_t i = 0; i < 4; i++) {
+        int16_t tx = x1 + 2 + i * (tw / 4);
+        display.drawLine(tx, y1, tx, y1 + m.dep / 2, OLED_BLACK);
+      }
+      break;
+    }
+    case 7: // scream
+      drawEllipseLocal(cx, cy, m.rx, m.ry, OLED_WHITE);
+      fillEllipseLocal(cx, cy, m.rx - 1, m.ry - 1, OLED_BLACK);
+      break;
+    case 8: { // zigzag
+      int16_t steps = 8;
+      for (int16_t i = 0; i < steps; i++) {
+        int16_t nx0 = x1 + (x2 - x1) * i / steps;
+        int16_t nx1 = x1 + (x2 - x1) * (i + 1) / steps;
+        int16_t ny0 = y1 + ((i % 2 == 0) ? 0 : 4);
+        int16_t ny1 = y1 + ((i % 2 == 0) ? 4 : 0);
+        display.drawLine(nx0, ny0, nx1, ny1, OLED_WHITE);
+      }
+      break;
+    }
+  }
+}
+
+void drawTear(int16_t x, int16_t y, int dx, int dy) {
+  x += dx; y += dy;
+  for (int16_t i = 0; i < 8; i++) {
+    display.drawPixel(x, y + i, OLED_WHITE);
+    if (i > 4) display.drawPixel(x - 1, y + i, OLED_WHITE);
+  }
+}
+
+// ─── RENDER EMOTION FRAME ──────────────────────────────────
+void renderEmotion(uint8_t emoIdx, uint8_t morphFrac, uint8_t fromIdx,
+                   bool blink, uint8_t morphSteps, int dx, int dy, int lookX, int lookY) {
+  EmoParam cur, tgt;
+  memcpy_P(&cur, &EMOTIONS[fromIdx], sizeof(EmoParam));
+  memcpy_P(&tgt, &EMOTIONS[emoIdx],  sizeof(EmoParam));
+
+  uint8_t step = morphFrac;
+  uint8_t total = morphSteps;
+
+  drawBrow(
+    lerpI(cur.browL.x, tgt.browL.x, step, total),
+    lerpI(cur.browL.y, tgt.browL.y, step, total),
+    lerpI(cur.browL.w, tgt.browL.w, step, total),
+    lerpI(cur.browL.angle, tgt.browL.angle, step, total),
+    dx, dy
+  );
+  drawBrow(
+    lerpI(cur.browR.x, tgt.browR.x, step, total),
+    lerpI(cur.browR.y, tgt.browR.y, step, total),
+    lerpI(cur.browR.w, tgt.browR.w, step, total),
+    lerpI(cur.browR.angle, tgt.browR.angle, step, total),
+    dx, dy
+  );
+
+  uint8_t lidBase = lerpI(cur.lid, tgt.lid, step, total);
+  uint8_t lid = blink ? 10 : lidBase;
+
+  EyeParam eL, eR;
+  if (cur.eyeL.type == tgt.eyeL.type && tgt.eyeL.type == 0) {
+    eL = {
+      (int8_t)lerpI(cur.eyeL.cx, tgt.eyeL.cx, step, total),
+      (int8_t)lerpI(cur.eyeL.cy, tgt.eyeL.cy, step, total),
+      (int8_t)lerpI(cur.eyeL.rx, tgt.eyeL.rx, step, total),
+      (int8_t)lerpI(cur.eyeL.ry, tgt.eyeL.ry, step, total),
+      (int8_t)lerpI(cur.eyeL.lx, tgt.eyeL.lx, step, total),
+      0
+    };
+  } else {
+    eL = (step < total / 2) ? cur.eyeL : tgt.eyeL;
+  }
+  if (cur.eyeR.type == tgt.eyeR.type && tgt.eyeR.type == 0) {
+    eR = {
+      (int8_t)lerpI(cur.eyeR.cx, tgt.eyeR.cx, step, total),
+      (int8_t)lerpI(cur.eyeR.cy, tgt.eyeR.cy, step, total),
+      (int8_t)lerpI(cur.eyeR.rx, tgt.eyeR.rx, step, total),
+      (int8_t)lerpI(cur.eyeR.ry, tgt.eyeR.ry, step, total),
+      (int8_t)lerpI(cur.eyeR.lx, tgt.eyeR.lx, step, total),
+      0
+    };
+  } else {
+    eR = (step < total / 2) ? cur.eyeR : tgt.eyeR;
+  }
+
+  drawEyeDispatch(eL, lid, blink, dx, dy, lookX, lookY);
+  drawEyeDispatch(eR, lid, blink, dx, dy, lookX, lookY);
+
+  MouthParam mouth;
+  if (cur.mouth.type == tgt.mouth.type) {
+    mouth = {
+      (int8_t)lerpI(cur.mouth.x1, tgt.mouth.x1, step, total),
+      (int8_t)lerpI(cur.mouth.y1, tgt.mouth.y1, step, total),
+      (int8_t)lerpI(cur.mouth.x2, tgt.mouth.x2, step, total),
+      (int8_t)lerpI(cur.mouth.y2, tgt.mouth.y2, step, total),
+      (int8_t)lerpI(cur.mouth.dep, tgt.mouth.dep, step, total),
+      (int8_t)lerpI(cur.mouth.cx, tgt.mouth.cx, step, total),
+      (int8_t)lerpI(cur.mouth.cy, tgt.mouth.cy, step, total),
+      (int8_t)lerpI(cur.mouth.rx, tgt.mouth.rx, step, total),
+      (int8_t)lerpI(cur.mouth.ry, tgt.mouth.ry, step, total),
+      cur.mouth.type
+    };
+  } else {
+    mouth = (step < total / 2) ? cur.mouth : tgt.mouth;
+  }
+  drawMouth(mouth, dx, dy);
+
+  if (tgt.tearL && step > total / 2) { drawTear(36, 33, dx, dy); drawTear(34, 35, dx, dy); }
+  if (tgt.tearR && step > total / 2) { drawTear(84, 33, dx, dy); drawTear(86, 35, dx, dy); }
+}
+
+
+enum BitmapMpuFace : uint8_t {
+  BMP_FACE_NORMAL,
+  BMP_FACE_CONTENT,
+  BMP_FACE_HAPPY,
+  BMP_FACE_LOVE,
+  BMP_FACE_SHY,
+  BMP_FACE_LAUGH,
+  BMP_FACE_PLEADING,
+  BMP_FACE_PROUD,
+  BMP_FACE_CURIOUS,
+  BMP_FACE_ANNOYED,
+  BMP_FACE_SURPRISED,
+  BMP_FACE_DIZZY,
+  BMP_FACE_SLEEPY,
+  BMP_FACE_HOT,
+  BMP_FACE_COLD,
+  BMP_FACE_SING,
+  BMP_FACE_ANGRY
+};
+
+struct BitmapLayerSpec {
+  const unsigned char* bits;
+  uint8_t srcW;
+  uint8_t srcH;
+  int16_t x;
+  int16_t y;
+  int16_t w;
+  int16_t h;
+  bool enabled;
+};
+
+struct BitmapFaceSpec {
+  BitmapLayerSpec left;
+  BitmapLayerSpec right;
+  BitmapLayerSpec mouth;
+  BitmapLayerSpec extra;
+};
+
+BitmapLayerSpec layerSpec(const unsigned char* bits, uint8_t srcW, uint8_t srcH,
+                          int16_t x, int16_t y, int16_t w, int16_t h) {
+  BitmapLayerSpec l;
+  l.bits = bits;
+  l.srcW = srcW;
+  l.srcH = srcH;
+  l.x = x;
+  l.y = y;
+  l.w = w;
+  l.h = h;
+  l.enabled = bits != nullptr;
+  return l;
+}
+
+BitmapLayerSpec noLayerSpec() {
+  return layerSpec(nullptr, 0, 0, 0, 0, 0, 0);
+}
+
+bool bitmapBitOn(const unsigned char* bits, int w, int x, int y) {
+  int rowBytes = (w + 7) / 8;
+  uint8_t b = pgm_read_byte(bits + y * rowBytes + x / 8);
+  return (b & (0x80 >> (x & 7))) != 0;
+}
+
+void drawBitmapScaled(const unsigned char* bits, int srcW, int srcH,
+                      int x, int y, int dstW, int dstH) {
+  if (!bits || srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
+  for (int yy = 0; yy < dstH; yy++) {
+    int py = y + yy;
+    if (py < 0 || py >= SCREEN_HEIGHT) continue;
+    int sy = (yy * srcH) / dstH;
+    for (int xx = 0; xx < dstW; xx++) {
+      int px = x + xx;
+      if (px < 0 || px >= SCREEN_WIDTH) continue;
+      int sx = (xx * srcW) / dstW;
+      if (bitmapBitOn(bits, srcW, sx, sy)) display.drawPixel(px, py, OLED_WHITE);
+    }
+  }
+}
+
+float smoothStep01(float t) {
+  if (t < 0.0f) t = 0.0f;
+  if (t > 1.0f) t = 1.0f;
+  return t * t * (3.0f - 2.0f * t);
+}
+
+int lerpBitmapInt(int a, int b, float t) {
+  return (int)((float)a + ((float)b - (float)a) * t + (t >= 0.0f ? 0.5f : -0.5f));
+}
+
+BitmapFaceSpec faceSpecFor(BitmapMpuFace face) {
+  BitmapFaceSpec f;
+  f.left = noLayerSpec();
+  f.right = noLayerSpec();
+  f.mouth = noLayerSpec();
+  f.extra = noLayerSpec();
+
+  switch (face) {
+    case BMP_FACE_CONTENT:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 29, 15, 24, 31);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 77, 15, 24, 31);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 56, 49, 18, 6);
+      break;
+    case BMP_FACE_HAPPY:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 27, 12, 27, 37);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 76, 12, 27, 37);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 55, 48, 20, 7);
+      break;
+    case BMP_FACE_LOVE:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 27, 11, 28, 39);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 75, 11, 28, 39);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 54, 48, 22, 7);
+      break;
+    case BMP_FACE_SHY:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 30, 16, 24, 33);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 76, 16, 24, 33);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 58, 50, 13, 5);
+      break;
+    case BMP_FACE_LAUGH:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 28, 33, 28, 10);
+      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 74, 33, 28, 10);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 52, 48, 27, 8);
+      break;
+    case BMP_FACE_PLEADING:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 26, 9, 30, 42);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 74, 9, 30, 42);
+      f.mouth = layerSpec(lpk_sleepy_layer_9, 16, 5, 58, 51, 13, 4);
+      break;
+    case BMP_FACE_PROUD:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 27, 15, 27, 32);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 76, 15, 27, 32);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 55, 48, 21, 6);
+      break;
+    case BMP_FACE_CURIOUS:
+      f.left = layerSpec(lpk_question_layer_9_1, 26, 32, 28, 18, 26, 32);
+      f.right = layerSpec(lpk_question_layer_9_copy_1, 26, 39, 76, 11, 26, 39);
+      f.mouth = layerSpec(lpk_question_layer_7, 16, 6, 57, 48, 16, 6);
+      break;
+    case BMP_FACE_ANNOYED:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 28, 34, 27, 11);
+      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 75, 34, 27, 11);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 57, 49, 16, 5);
+      break;
+    case BMP_FACE_SURPRISED:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 25, 9, 30, 42);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 73, 9, 30, 42);
+      f.mouth = layerSpec(img_sing_mouth, 20, 12, 58, 47, 12, 8);
+      break;
+    case BMP_FACE_DIZZY:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 30, 14, 25, 36);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 74, 14, 25, 36);
+      f.mouth = layerSpec(lpk_question_layer_7, 16, 6, 57, 49, 16, 6);
+      break;
+    case BMP_FACE_SLEEPY:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 28, 41, 26, 9);
+      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 77, 41, 26, 9);
+      f.mouth = layerSpec(lpk_sleepy_layer_9, 16, 5, 57, 49, 16, 5);
+      f.extra = layerSpec(lpk_sleepy_layer_11, 10, 14, 105, 14, 10, 14);
+      break;
+    case BMP_FACE_HOT:
+      f.left = layerSpec(lpk_sleepy_layer_6, 26, 9, 28, 35, 27, 12);
+      f.right = layerSpec(lpk_sleepy_layer_6, 26, 9, 75, 35, 27, 12);
+      f.mouth = layerSpec(img_sing_mouth, 20, 12, 56, 46, 16, 10);
+      break;
+    case BMP_FACE_COLD:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 31, 18, 21, 28);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 78, 18, 21, 28);
+      f.mouth = layerSpec(lpk_sleepy_layer_9, 16, 5, 58, 51, 13, 4);
+      break;
+    case BMP_FACE_SING:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 28, 13, 26, 37);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 76, 13, 26, 37);
+      f.mouth = layerSpec(img_sing_mouth, 20, 12, 56, 46, 16, 10);
+      break;
+    case BMP_FACE_ANGRY:
+      f.left = layerSpec(lpk_scary_eyes, 61, 20, 33, 16, 61, 20);
+      f.mouth = layerSpec(lpk_scary_mouth, 59, 15, 38, 44, 51, 11);
+      break;
+    case BMP_FACE_NORMAL:
+    default:
+      f.left = layerSpec(lpk_normal_layer_9, 26, 37, 28, 13, 26, 37);
+      f.right = layerSpec(lpk_normal_layer_8, 26, 37, 76, 13, 26, 37);
+      f.mouth = layerSpec(lpk_normal_layer_7, 16, 6, 57, 48, 16, 6);
+      break;
+  }
+  return f;
+}
+
+void drawMorphLayer(const BitmapLayerSpec& from, const BitmapLayerSpec& to, float t,
+                    int dx, int dy) {
+  if (!from.enabled && !to.enabled) return;
+  const BitmapLayerSpec& a = from.enabled ? from : to;
+  const BitmapLayerSpec& b = to.enabled ? to : from;
+  int ax = a.x + a.w / 2;
+  int ay = a.y + a.h / 2;
+  int bx = b.x + b.w / 2;
+  int by = b.y + b.h / 2;
+  if (from.enabled && t < 0.82f) {
+    float outT = smoothStep01(clampFloat(t / 0.82f, 0.0f, 1.0f));
+    int cx = lerpBitmapInt(ax, bx, t * 0.78f);
+    int cy = lerpBitmapInt(ay, by, t * 0.78f);
+    int w = lerpBitmapInt(from.w, to.enabled ? to.w : from.w, t);
+    int h = lerpBitmapInt(from.h, to.enabled ? to.h : from.h, t);
+    w = max(1, (int)(w * (1.0f - outT * 0.28f)));
+    h = max(1, (int)(h * (1.0f - outT * 0.22f)));
+    drawBitmapScaled(from.bits, from.srcW, from.srcH, cx - w / 2 + dx, cy - h / 2 + dy, w, h);
+  }
+  if (to.enabled && t > 0.18f) {
+    float inT = smoothStep01(clampFloat((t - 0.18f) / 0.82f, 0.0f, 1.0f));
+    int cx = lerpBitmapInt(ax, bx, 0.22f + inT * 0.78f);
+    int cy = lerpBitmapInt(ay, by, 0.22f + inT * 0.78f);
+    int w = lerpBitmapInt(from.enabled ? max(1, from.w / 2) : 1, to.w, inT);
+    int h = lerpBitmapInt(from.enabled ? max(1, from.h / 2) : 1, to.h, inT);
+    drawBitmapScaled(to.bits, to.srcW, to.srcH, cx - w / 2 + dx, cy - h / 2 + dy, w, h);
+  }
+}
+
+void drawBitmapFaceMorph(BitmapMpuFace from, BitmapMpuFace to, float t, int dx, int dy) {
+  BitmapFaceSpec a = faceSpecFor(from);
+  BitmapFaceSpec b = faceSpecFor(to);
+  drawMorphLayer(a.left, b.left, t, dx, dy);
+  drawMorphLayer(a.right, b.right, t, dx, dy);
+  drawMorphLayer(a.mouth, b.mouth, t, dx, dy);
+  drawMorphLayer(a.extra, b.extra, t, dx, dy);
+}
+
+void drawBitmapLayerDynamic(const BitmapLayerSpec& l, int dx, int dy,
+                            int ox, int oy, int addW, int addH) {
+  if (!l.enabled) return;
+  int w = max(1, (int)l.w + addW);
+  int h = max(1, (int)l.h + addH);
+  int x = l.x + dx + ox - addW / 2;
+  int y = l.y + dy + oy - addH / 2;
+  drawBitmapScaled(l.bits, l.srcW, l.srcH, x, y, w, h);
+}
+
+void drawMiniHeart(int x, int y) {
+  display.fillCircle(x - 1, y, 1, OLED_WHITE);
+  display.fillCircle(x + 1, y, 1, OLED_WHITE);
+  display.drawPixel(x, y + 2, OLED_WHITE);
+}
+
+void drawSoftSparkle(int x, int y, int r) {
+  display.drawPixel(x, y, OLED_WHITE);
+  display.drawFastHLine(x - r, y, r * 2 + 1, OLED_WHITE);
+  display.drawFastVLine(x, y - r, r * 2 + 1, OLED_WHITE);
+}
+
+void drawBitmapFaceStable(BitmapMpuFace face, unsigned long now, bool active,
+                          int dx, int dy, int lookX, int lookY,
+                          float blinkL, float blinkR,
+                          float motionPower, float voicePower,
+                          float reactionPulse, uint8_t actionKind,
+                          float actionPulse) {
+  BitmapFaceSpec f = faceSpecFor(face);
+  float t = now * 0.001f;
+  float breathe = sinf(t * 1.55f);
+  float soft = sinf(t * 2.10f + 0.7f);
+  float quick = sinf(t * 5.80f);
+  float song = active ? sinf(t * 8.00f) : 0.0f;
+  int baseBob = (int)(breathe * 1.2f + song * 0.9f);
+  int baseSway = (int)(sinf(t * 1.05f + 1.6f) * 1.0f);
+  int eyeAddW = 0;
+  int eyeAddH = 0;
+  int mouthAddW = 0;
+  int mouthAddH = 0;
+  int eyeExtraX = 0;
+  int eyeExtraY = 0;
+  int mouthExtraX = 0;
+  int mouthExtraY = 0;
+  int extraExtraY = 0;
+  int leftEyeExtraX = 0;
+  int rightEyeExtraX = 0;
+  int leftEyeExtraY = 0;
+  int rightEyeExtraY = 0;
+  int leftEyeAddW = 0;
+  int rightEyeAddW = 0;
+  int leftEyeAddH = 0;
+  int rightEyeAddH = 0;
+
+  float alive = 0.55f + motionPower * 1.25f + voicePower * 1.35f + actionPulse * 0.95f;
+  if (alive > 2.8f) alive = 2.8f;
+
+  dx += baseSway;
+  dy += baseBob;
+  dy -= (int)(reactionPulse * 2.2f);
+
+  leftEyeExtraX += (int)(sinf(t * 2.7f + 0.3f) * alive * 0.65f);
+  rightEyeExtraX += (int)(sinf(t * 2.4f + 1.8f) * alive * 0.65f);
+  leftEyeExtraY += (int)(cosf(t * 2.0f + 0.4f) * alive * 0.42f);
+  rightEyeExtraY += (int)(cosf(t * 2.25f + 1.1f) * alive * 0.42f);
+  mouthExtraY += (int)(sinf(t * 1.9f + 2.0f) * alive * 0.30f);
+
+  if (actionKind == 1) {
+    dy -= (int)(actionPulse * 3.0f);
+    eyeAddH += (int)(actionPulse * 2.0f);
+    mouthAddW += (int)(actionPulse * 4.0f);
+    drawSoftSparkle(18, 19 - (int)(actionPulse * 5.0f), 1);
+    drawSoftSparkle(111, 17 - (int)(actionPulse * 4.0f), 1);
+  } else if (actionKind == 2) {
+    int peek = (int)(sinf(actionPulse * 3.1415926f) * 4.0f);
+    eyeExtraX += peek;
+    mouthExtraX -= peek / 2;
+  } else if (actionKind == 3) {
+    mouthAddW += (int)(actionPulse * 3.0f);
+    leftEyeAddW += (int)(actionPulse * 2.0f);
+    rightEyeAddH -= (int)(actionPulse * 2.0f);
+  } else if (actionKind == 4) {
+    int rise = (int)(actionPulse * 8.0f);
+    drawMiniHeart(20, 48 - rise);
+    drawMiniHeart(110, 47 - rise / 2);
+  }
+
+  if (face == BMP_FACE_NORMAL) {
+    eyeExtraY += (int)(soft * 0.8f);
+    mouthExtraY += (int)(sinf(t * 2.0f + 0.4f) * 0.8f);
+    if (actionPulse > 0.01f) {
+      mouthAddW += (int)(actionPulse * 2.0f);
+      leftEyeExtraY -= (int)(actionPulse * 1.4f);
+      rightEyeExtraY -= (int)(actionPulse * 1.0f);
+    }
+  } else if (face == BMP_FACE_CONTENT) {
+    eyeExtraY += (int)(breathe * 0.9f);
+    mouthAddW += 1;
+    mouthExtraY += (int)(sinf(t * 1.9f + 0.5f) * 0.8f);
+    leftEyeExtraX -= (int)(actionPulse * 1.6f);
+    rightEyeExtraX += (int)(actionPulse * 1.6f);
+  } else if (face == BMP_FACE_HAPPY) {
+    int bounce = (int)(-fabsf(sinf(t * 4.7f)) * (2.0f + actionPulse * 2.0f));
+    dy += bounce;
+    eyeAddW = 1 + (int)(fabsf(sinf(t * 3.2f)) * 1.2f);
+    eyeAddH = (int)(fabsf(sinf(t * 3.2f + 0.5f)) * 1.2f);
+    mouthAddW = 2 + (int)(fabsf(sinf(t * 4.0f)) * 2.0f);
+    mouthExtraY = (int)(sinf(t * 4.4f) * 1.0f);
+    leftEyeExtraY -= (int)(fabsf(sinf(t * 5.0f)) * 1.2f);
+    rightEyeExtraY -= (int)(fabsf(sinf(t * 5.0f + 0.7f)) * 1.2f);
+    int heartRise = (int)((now / 90UL) % 12UL);
+    drawMiniHeart(19, 48 - heartRise / 2);
+    drawMiniHeart(111, 47 - (heartRise + 5) / 2);
+  } else if (face == BMP_FACE_LOVE) {
+    float glow = fabsf(sinf(t * 2.8f));
+    dy -= (int)(glow * 1.4f);
+    eyeAddW = 1 + (int)(glow * 2.0f);
+    eyeAddH = 1 + (int)(glow * 2.0f);
+    mouthAddW = 2 + (int)(glow * 3.0f);
+    int rise = (int)((now / 80UL) % 18UL);
+    drawMiniHeart(17, 49 - rise / 2);
+    drawMiniHeart(112, 46 - ((rise + 8) % 18) / 2);
+    drawMiniHeart(64 + (int)(sinf(t * 2.0f) * 6.0f), 12 + (int)(cosf(t * 1.8f) * 3.0f));
+  } else if (face == BMP_FACE_SHY) {
+    lookX -= 1;
+    lookY += 1;
+    dx += (int)(sinf(t * 1.7f) * 1.0f);
+    mouthExtraY += 1;
+    for (int i = 0; i < 3; i++) {
+      display.drawLine(20 + i * 4, 46 + i % 2, 23 + i * 4, 45 + i % 2, OLED_WHITE);
+      display.drawLine(103 + i * 4, 45 + i % 2, 106 + i * 4, 46 + i % 2, OLED_WHITE);
+    }
+  } else if (face == BMP_FACE_LAUGH) {
+    int laughBounce = (int)(-fabsf(sinf(t * 6.0f)) * 3.0f);
+    dy += laughBounce;
+    mouthAddW = 3 + (int)(fabsf(sinf(t * 6.0f)) * 4.0f);
+    mouthAddH = 1;
+    mouthExtraY = (int)(sinf(t * 6.0f + 0.5f) * 1.0f);
+    drawSoftSparkle(18, 18 + (int)(soft * 2.0f), 1);
+    drawSoftSparkle(112, 18 - (int)(soft * 2.0f), 1);
+  } else if (face == BMP_FACE_PLEADING) {
+    lookY -= 1;
+    eyeAddW = 1 + (int)(fabsf(sinf(t * 2.4f)) * 2.0f);
+    eyeAddH = 1 + (int)(fabsf(sinf(t * 2.4f)) * 2.0f);
+    mouthExtraY += 1;
+    display.drawPixel(36, 48 + (int)(soft * 1.0f), OLED_WHITE);
+    display.drawPixel(92, 48 - (int)(soft * 1.0f), OLED_WHITE);
+  } else if (face == BMP_FACE_PROUD) {
+    dy -= 1;
+    lookY -= 1;
+    eyeAddH -= 1;
+    mouthAddW += 2;
+    drawSoftSparkle(20, 18 + (int)(sinf(t * 2.0f) * 2.0f), 2);
+    drawSoftSparkle(110, 20 - (int)(sinf(t * 1.8f) * 2.0f), 1);
+  } else if (face == BMP_FACE_CURIOUS) {
+    float scan = sinf(t * 1.8f);
+    float think = sinf(t * 3.1f + 0.5f);
+    dx += (int)(scan * 1.2f);
+    dy += (int)(-fabsf(scan) * 1.0f);
+    eyeExtraX += (int)(scan * 3.0f);
+    eyeExtraY += (int)(think * 1.4f);
+    leftEyeExtraY -= (int)(fabsf(scan) * 1.2f);
+    rightEyeExtraY += (int)(think * 1.1f);
+    leftEyeAddH += (int)(fabsf(think) * 1.0f);
+    rightEyeAddW += (int)(fabsf(scan) * 1.0f);
+    mouthExtraX += (int)(sinf(t * 2.4f + 1.0f) * 1.0f);
+    mouthExtraY += (int)(think * 1.0f);
+    uint8_t thoughtPhase = (uint8_t)((now / 900UL) % 4UL);
+    if (thoughtPhase == 1) {
+      int qx = 104 + (int)(sinf(t * 4.2f) * 3.0f);
+      int qy = 4 + (int)(cosf(t * 3.2f) * 2.0f);
+      drawBitmapScaled(lpk_question_layer_4, 6, 10, qx, qy, 6, 10);
+    } else {
+      int dotY = 10 + (int)(sinf(t * 2.0f) * 2.0f);
+      display.drawPixel(105, dotY, OLED_WHITE);
+      display.drawPixel(110, dotY + 2, OLED_WHITE);
+      if (thoughtPhase == 3) drawSoftSparkle(113, dotY + 5, 1);
+    }
+  } else if (face == BMP_FACE_ANNOYED) {
+    lookX += (int)(sinf(t * 2.6f) * 1.8f);
+    eyeAddW += (int)(fabsf(soft) * 1.0f);
+    mouthAddW -= 2;
+    mouthExtraX += (int)(sinf(t * 2.1f + 2.0f) * 1.0f);
+    int browLift = (int)(sinf(t * 2.2f) * 1.0f);
+    display.drawLine(29, 29 + browLift, 54, 27 + browLift, OLED_WHITE);
+    display.drawLine(76, 27 - browLift, 101, 29 - browLift, OLED_WHITE);
+  } else if (face == BMP_FACE_SURPRISED) {
+    float pop = fabsf(sinf(t * 5.2f));
+    eyeAddW = 1 + (int)(pop * 3.0f);
+    eyeAddH = 1 + (int)(pop * 2.0f);
+    mouthAddW = (int)(pop * 3.0f);
+    mouthAddH = (int)(pop * 2.0f);
+    dy -= (int)(pop * 2.0f);
+    drawSoftSparkle(18, 14 + (int)(soft * 2.0f), 2);
+    drawSoftSparkle(111, 17 - (int)(soft * 2.0f), 1);
+  } else if (face == BMP_FACE_DIZZY) {
+    float dizzyPower = clampFloat(spinSmooth + shakeSmooth * 0.55f, 0.25f, 1.0f);
+    float orbit = t * (5.2f + dizzyPower * 8.0f);
+    eyeExtraX += (int)(sinf(orbit) * (2.0f + dizzyPower * 3.0f));
+    eyeExtraY += (int)(cosf(orbit * 0.9f) * (1.0f + dizzyPower * 2.0f));
+    leftEyeExtraX += (int)(sinf(orbit + 1.1f) * (1.0f + dizzyPower * 2.0f));
+    rightEyeExtraX += (int)(cosf(orbit + 0.5f) * (1.0f + dizzyPower * 2.0f));
+    leftEyeAddH += (int)(sinf(orbit * 0.8f) * 1.0f);
+    rightEyeAddW += (int)(cosf(orbit * 0.7f) * 1.0f);
+    mouthExtraX += (int)(sinf(orbit * 0.7f + 1.0f) * (1.0f + dizzyPower));
+    mouthExtraY += (int)(cosf(orbit * 0.6f) * (1.0f + dizzyPower));
+    dx += (int)(sinf(t * (2.2f + dizzyPower)) * (0.8f + dizzyPower * 1.6f));
+    dy += (int)(cosf(t * (2.0f + dizzyPower)) * (0.8f + dizzyPower * 1.2f));
+    for (int i = 0; i < 4; i++) {
+      float a = orbit + i * 2.1f;
+      int px = 18 + (int)(cosf(a) * (4 + i + dizzyPower * 4.0f));
+      int py = 13 + (int)(sinf(a) * (3 + i + dizzyPower * 2.0f));
+      display.drawCircle(px, py, 1 + (i & 1), OLED_WHITE);
+    }
+    display.drawCircle(106 + (int)(sinf(orbit) * (3.0f + dizzyPower * 2.0f)),
+                       13 + (int)(cosf(orbit) * (2.0f + dizzyPower * 2.0f)), 3, OLED_WHITE);
+    display.drawPixel(64 + (int)(cosf(orbit * 0.55f) * 14.0f), 8 + (int)(sinf(orbit * 0.55f) * 3.0f), OLED_WHITE);
+  } else if (face == BMP_FACE_SLEEPY) {
+    eyeExtraY += (int)(sinf(t * 1.4f) * 1.0f);
+    mouthExtraY += (int)(sinf(t * 1.8f + 0.8f) * 1.0f);
+    extraExtraY += -(int)((now / 180UL) % 10UL);
+  } else if (face == BMP_FACE_HOT) {
+    float pant = fabsf(sinf(t * 4.7f));
+    dy += (int)(pant * 1.0f);
+    mouthAddW += (int)(pant * 3.0f);
+    mouthAddH += (int)(pant * 2.0f);
+    eyeExtraY += 1;
+    int sx = 20 + (int)(sinf(t * 2.5f) * 1.0f);
+    display.fillCircle(sx, 18, 2, OLED_WHITE);
+    display.fillTriangle(sx - 2, 17, sx + 2, 17, sx, 10, OLED_WHITE);
+  } else if (face == BMP_FACE_COLD) {
+    float tremble = sinf(t * 5.2f) * 1.2f;
+    dx += (int)tremble;
+    eyeAddW -= 1;
+    mouthExtraX += (int)(-tremble);
+    display.drawLine(18, 17, 22, 13, OLED_WHITE);
+    display.drawLine(22, 13, 26, 17, OLED_WHITE);
+    display.drawLine(106, 17, 110, 13, OLED_WHITE);
+    display.drawLine(110, 13, 114, 17, OLED_WHITE);
+  } else if (face == BMP_FACE_SING) {
+    float beat = fabsf(sinf(t * 7.2f));
+    float voiceBeat = max(beat * 0.55f, voicePower);
+    dy += (int)(sinf(t * 3.6f) * (1.2f + voicePower * 2.0f));
+    dx += (int)(sinf(t * 2.1f) * voicePower * 2.0f);
+    eyeExtraX += (int)(sinf(t * 2.2f) * (1.0f + voicePower * 2.2f));
+    leftEyeExtraY -= (int)(voiceBeat * 1.5f);
+    rightEyeExtraY -= (int)(sinf(t * 6.5f + 0.8f) * voicePower * 1.3f);
+    mouthAddW += (int)(voiceBeat * 5.0f);
+    mouthAddH += (int)(voiceBeat * 4.0f);
+    int nY = 18 - (int)((now / 120UL) % 8UL);
+    display.drawCircle(17, nY + 8, 2, OLED_WHITE);
+    display.drawFastVLine(20, nY, 8, OLED_WHITE);
+    display.drawFastHLine(20, nY, 5, OLED_WHITE);
+    display.drawCircle(109, nY + 11, 2, OLED_WHITE);
+    display.drawFastVLine(112, nY + 3, 8, OLED_WHITE);
+  } else if (face == BMP_FACE_ANGRY) {
+    float charge = fabsf(sinf(t * 3.5f));
+    float recoil = powf(fabsf(sinf(t * 2.2f)), 5.0f);
+    dx += (int)(sinf(t * 4.4f) * (0.8f + charge * 0.9f));
+    dy -= (int)(charge * 1.4f + recoil * 2.0f);
+    mouthAddW += (int)(charge * 3.0f);
+    mouthExtraY += (int)(recoil * 1.4f);
+    eyeAddW += (int)(charge * 2.0f);
+    eyeAddH -= 1;
+    leftEyeExtraX += (int)(recoil * -2.0f);
+    rightEyeExtraX += (int)(recoil * 2.0f);
+    display.drawBitmap(13 + (int)(sinf(t * 8.0f) * 1.0f), 8 + (int)(cosf(t * 5.0f) * 1.0f),
+                       img_angry_vein, 8, 8, OLED_WHITE);
+    display.drawLine(104, 11, 121, 8 + (int)(sinf(t * 4.0f) * 2.0f), OLED_WHITE);
+    display.drawLine(106, 16, 122, 15 + (int)(cosf(t * 3.6f) * 2.0f), OLED_WHITE);
+    if (((now / 180UL) % 2UL) == 0) {
+      display.drawLine(24, 7, 18, 4, OLED_WHITE);
+      display.drawLine(116, 29, 123, 27, OLED_WHITE);
+    }
+  }
+
+  bool blinkable = face != BMP_FACE_DIZZY && face != BMP_FACE_ANGRY &&
+                   face != BMP_FACE_SLEEPY && face != BMP_FACE_ANNOYED &&
+                   face != BMP_FACE_LAUGH;
+  int leftBlinkH = blinkable && f.left.h > 12 ? -(int)((float)(f.left.h - 5) * blinkL) : 0;
+  int rightBlinkH = blinkable && f.right.h > 12 ? -(int)((float)(f.right.h - 5) * blinkR) : 0;
+
+  drawBitmapLayerDynamic(f.left, dx, dy, lookX + eyeExtraX + leftEyeExtraX, lookY + eyeExtraY + leftEyeExtraY,
+                         eyeAddW + leftEyeAddW, eyeAddH + leftEyeAddH + leftBlinkH);
+  drawBitmapLayerDynamic(f.right, dx, dy, lookX + eyeExtraX + rightEyeExtraX, lookY + eyeExtraY + rightEyeExtraY,
+                         eyeAddW + rightEyeAddW, eyeAddH + rightEyeAddH + rightBlinkH);
+  drawBitmapLayerDynamic(f.mouth, dx, dy, mouthExtraX, mouthExtraY,
+                         mouthAddW, mouthAddH);
+  drawBitmapLayerDynamic(f.extra, dx, dy, 0, extraExtraY, 0, 0);
 }
 
 void drawMochi(bool active) {
   if (!oledReady) return;
   unsigned long now = millis();
+  static float bitmapSmoothLookX = 0.0f;
+  static float bitmapSmoothLookY = 0.0f;
+  static float bitmapTargetLookX = 0.0f;
+  static float bitmapTargetLookY = 0.0f;
+  static unsigned long nextNormalGlanceMs = 0;
+  static BitmapMpuFace bitmapShownFace = BMP_FACE_NORMAL;
+  static BitmapMpuFace bitmapPreviousFace = BMP_FACE_NORMAL;
+  static unsigned long bitmapMorphStartMs = 0;
+  static BitmapMpuFace bitmapIdleFace = BMP_FACE_NORMAL;
+  static unsigned long nextCuteIdleMs = 0;
+  static unsigned long bitmapBlinkStartMs = 0;
+  static unsigned long nextBitmapBlinkMs = 900;
+  static unsigned long bitmapWinkStartMs = 0;
+  static unsigned long nextBitmapWinkMs = 6500;
+  static bool bitmapWinkLeft = false;
+  static unsigned long bitmapActionStartMs = 0;
+  static unsigned long nextBitmapActionMs = 2600;
+  static uint8_t bitmapActionKind = 0;
+
+  bool bitmapMpuReady = mpuReady || rawMpuMode;
+  bool bitmapCalm = !active && (!bitmapMpuReady || (shakeSmooth < 0.18f && spinSmooth < 0.12f && fabsf(tiltX) < 0.28f && fabsf(tiltY) < 0.32f));
+  if (!active && now >= nextCuteIdleMs) {
+    switch (random(0, 8)) {
+      case 0: bitmapIdleFace = BMP_FACE_NORMAL; break;
+      case 1: bitmapIdleFace = BMP_FACE_CONTENT; break;
+      case 2: bitmapIdleFace = BMP_FACE_HAPPY; break;
+      case 3: bitmapIdleFace = BMP_FACE_SHY; break;
+      case 4: bitmapIdleFace = BMP_FACE_PROUD; break;
+      case 5: bitmapIdleFace = BMP_FACE_PLEADING; break;
+      case 6: bitmapIdleFace = BMP_FACE_LOVE; break;
+      default: bitmapIdleFace = BMP_FACE_CONTENT; break;
+    }
+    nextCuteIdleMs = now + random(4200, 9000);
+  }
+
+  float bitmapActionPulse = 0.0f;
+  if (bitmapCalm && bitmapActionStartMs == 0 && now >= nextBitmapActionMs) {
+    bitmapActionStartMs = now;
+    bitmapActionKind = (uint8_t)random(1, 5);
+    nextBitmapActionMs = now + random(4200, 8500);
+  }
+  if (bitmapActionStartMs != 0) {
+    unsigned long actionAge = now - bitmapActionStartMs;
+    if (actionAge < 1150UL) {
+      float p = (float)actionAge / 1150.0f;
+      bitmapActionPulse = sinf(p * 3.1415926f);
+    } else {
+      bitmapActionStartMs = 0;
+      bitmapActionKind = 0;
+    }
+  }
+
+  BitmapMpuFace bitmapTargetFace = bitmapIdleFace;
+  if (bitmapMpuReady && (superAngryMode || angryMode)) {
+    bitmapTargetFace = BMP_FACE_ANGRY;
+  } else if (bitmapMpuReady && (now < dizzyUntilMs || now < headShakeUntilMs || shakeSmooth > 0.62f || spinSmooth > 0.32f || spinMeter > 0.38f)) {
+    bitmapTargetFace = BMP_FACE_DIZZY;
+  } else if (bitmapMpuReady && (now < freefallUntilMs || now < surprisedUntilMs)) {
+    bitmapTargetFace = BMP_FACE_SURPRISED;
+  } else if (active) {
+    bitmapTargetFace = BMP_FACE_SING;
+  } else if (now < touchLoveUntilMs) {
+    bitmapTargetFace = BMP_FACE_LOVE;
+  } else if (now < laughUntilMs) {
+    bitmapTargetFace = BMP_FACE_LAUGH;
+  } else if (now < touchHappyUntilMs) {
+    bitmapTargetFace = BMP_FACE_HAPPY;
+  } else if (faceDownMode || now < sadUntilMs) {
+    bitmapTargetFace = BMP_FACE_SLEEPY;
+  } else if (now < pantUntilMs || tempMood > 0.45f) {
+    bitmapTargetFace = BMP_FACE_HOT;
+  } else if (tempMood < -0.45f) {
+    bitmapTargetFace = BMP_FACE_COLD;
+  } else if (bitmapMpuReady && (now < annoyedUntilMs || shakeSmooth > 0.30f)) {
+    bitmapTargetFace = BMP_FACE_ANNOYED;
+  } else if (bitmapMpuReady && now < nodUntilMs) {
+    bitmapTargetFace = BMP_FACE_HAPPY;
+  } else if (bitmapMpuReady && (now < curiousUntilMs || fabsf(tiltX) > 0.32f || fabsf(tiltY) > 0.34f)) {
+    bitmapTargetFace = BMP_FACE_CURIOUS;
+  } else if (now < micActiveUntilMs) {
+    bitmapTargetFace = BMP_FACE_CURIOUS;
+  }
+
+  if (bitmapTargetFace != bitmapShownFace) {
+    bitmapPreviousFace = bitmapShownFace;
+    bitmapShownFace = bitmapTargetFace;
+    bitmapMorphStartMs = now;
+  }
+
+  if (now >= nextNormalGlanceMs) {
+    uint8_t glanceKind = (uint8_t)random(0, 10);
+    if (glanceKind < 3) {
+      bitmapTargetLookX = 0.0f;
+      bitmapTargetLookY = 0.0f;
+    } else if (glanceKind < 7) {
+      bitmapTargetLookX = (float)random(-5, 6);
+      bitmapTargetLookY = (float)random(-1, 2);
+    } else {
+      bitmapTargetLookX = (float)random(-3, 4);
+      bitmapTargetLookY = (float)random(-2, 3);
+    }
+    nextNormalGlanceMs = now + (active ? random(700, 1800) : random(1100, 3200));
+  }
+
+  if (bitmapBlinkStartMs == 0 && bitmapWinkStartMs == 0 && now >= nextBitmapBlinkMs) {
+    bitmapBlinkStartMs = now;
+    nextBitmapBlinkMs = now + random(2300, active ? 4200 : 5800);
+  }
+
+  if (!active && bitmapBlinkStartMs == 0 && bitmapWinkStartMs == 0 && now >= nextBitmapWinkMs) {
+    bitmapWinkStartMs = now;
+    bitmapWinkLeft = random(0, 2) == 0;
+    nextBitmapWinkMs = now + random(12000, 22000);
+  }
+
+  float bitmapBlinkL = 0.0f;
+  float bitmapBlinkR = 0.0f;
+  if (bitmapBlinkStartMs != 0) {
+    unsigned long blinkAge = now - bitmapBlinkStartMs;
+    if (blinkAge < 210UL) {
+      float p = (float)blinkAge / 210.0f;
+      float b = sinf(p * 3.1415926f);
+      bitmapBlinkL = b;
+      bitmapBlinkR = b;
+    } else {
+      bitmapBlinkStartMs = 0;
+    }
+  }
+  if (bitmapWinkStartMs != 0) {
+    unsigned long winkAge = now - bitmapWinkStartMs;
+    if (winkAge < 520UL) {
+      float p = (float)winkAge / 520.0f;
+      float w = sinf(p * 3.1415926f);
+      if (bitmapWinkLeft) bitmapBlinkL = max(bitmapBlinkL, w);
+      else bitmapBlinkR = max(bitmapBlinkR, w);
+    } else {
+      bitmapWinkStartMs = 0;
+    }
+  }
+
+  float bitmapMpuLookX = bitmapMpuReady ? clampFloat(tiltX * 2.2f, -2.5f, 2.5f) : 0.0f;
+  float bitmapMpuLookY = bitmapMpuReady ? clampFloat(tiltY * 1.5f, -1.5f, 1.5f) : 0.0f;
+  float bitmapMicroLookX = sinf(now * (active ? 0.0038f : 0.0018f)) * (active ? 1.8f : 0.8f);
+  float bitmapMicroLookY = sinf(now * 0.0013f + 1.1f) * 0.5f;
+  float bitmapBreathe = sinf(now * 0.0016f);
+  float bitmapTinySway = sinf(now * 0.0011f + 1.4f);
+  float bitmapSongPulse = active ? sinf(now * 0.0075f) * 0.8f : 0.0f;
+  float bitmapShakeBob = bitmapMpuReady ? clampFloat(shakeSmooth * 2.2f, 0.0f, 2.2f) : 0.0f;
+  float bitmapSpinFloat = bitmapMpuReady ? clampFloat(spinSmooth * 3.0f, 0.0f, 3.0f) : 0.0f;
+  float bitmapMotionPower = bitmapMpuReady ? clampFloat(shakeSmooth + spinSmooth * 0.8f + fabsf(tiltX) * 0.22f + fabsf(tiltY) * 0.16f, 0.0f, 1.0f) : 0.0f;
+  float bitmapVoicePower = active ? clampFloat(levelSmooth * 1.8f, 0.0f, 1.0f) : 0.0f;
+  float bitmapLookEase = (active || bitmapShownFace == BMP_FACE_CURIOUS || bitmapShownFace == BMP_FACE_DIZZY) ? 0.14f : 0.085f;
+  bitmapSmoothLookX += (bitmapTargetLookX + bitmapMpuLookX + bitmapMicroLookX - bitmapSmoothLookX) * bitmapLookEase;
+  bitmapSmoothLookY += (bitmapTargetLookY + bitmapMpuLookY + bitmapMicroLookY - bitmapSmoothLookY) * bitmapLookEase;
+
+  int bitmapBodyX = (int)(bitmapTinySway * 0.8f + (bitmapMpuReady ? tiltX * 1.2f : 0.0f) + sinf(now * 0.006f) * bitmapSpinFloat + sinf(now * 0.0025f) * bitmapActionPulse * 2.0f);
+  int bitmapBodyY = (int)(bitmapBreathe * 1.2f + bitmapSongPulse + bitmapShakeBob + cosf(now * 0.005f) * bitmapSpinFloat * 0.6f - bitmapActionPulse * 1.8f);
+  int bitmapEyeX = (int)bitmapSmoothLookX;
+  int bitmapEyeY = (int)bitmapSmoothLookY;
+
+  const unsigned long bitmapMorphDurationMs = 560UL;
+  float bitmapMorphT = bitmapMorphStartMs == 0 ? 1.0f
+                       : (float)(now - bitmapMorphStartMs) / (float)bitmapMorphDurationMs;
+  bool bitmapMorphing = bitmapMorphT < 1.0f;
+  bitmapMorphT = smoothStep01(bitmapMorphT);
+  float bitmapReactionPulse = 0.0f;
+  if (bitmapMorphStartMs != 0) {
+    unsigned long reactionAge = now - bitmapMorphStartMs;
+    if (reactionAge < 920UL) {
+      bitmapReactionPulse = sinf(((float)reactionAge / 920.0f) * 3.1415926f);
+    }
+  }
+
+  display.clearDisplay();
+  if (bitmapMorphing) {
+    int morphPopY = -(int)(bitmapReactionPulse * 2.0f);
+    int morphPopX = (int)(sinf(bitmapMorphT * 6.2831852f) * bitmapReactionPulse * 1.2f);
+    drawBitmapFaceMorph(bitmapPreviousFace, bitmapShownFace, bitmapMorphT, bitmapBodyX + morphPopX, bitmapBodyY + morphPopY);
+  } else {
+    drawBitmapFaceStable(bitmapShownFace, now, active, bitmapBodyX, bitmapBodyY,
+                         bitmapEyeX, bitmapEyeY, bitmapBlinkL, bitmapBlinkR,
+                         bitmapMotionPower, bitmapVoicePower, bitmapReactionPulse,
+                         bitmapActionKind, bitmapActionPulse);
+  }
+  display.display();
+  return;
+
   float songSec = (float)playedBytes / (float)(AUDIO_RATE * 2UL);
   CueMood cue = active ? cueMoodAt(songSec) : CUE_IDLE;
   float targetCue = active ? 1.0f : 0.0f;
@@ -959,7 +1986,7 @@ void drawMochi(bool active) {
   float tiltLookY = mpuReady ? tiltY * 2.2f : 0.0f;
 
   if (!active && motion < 0.1f && now >= nextIdleExprMs) {
-    idleExpr = random(0, 10); // 0=Normal,1=Curious,2=Shy,3=Bored,4=Excited,5=Squint,6=Thinking,7=Smug,8=BigEyes,9=HalfClosed
+    idleExpr = random(0, 14); // 0 to 13 to include new expressions
     nextIdleExprMs = now + random(4000, 10000);
     // Occasionally wink during idle
     if (random(0, 3) == 0 && !isWinking) {
@@ -1143,282 +2170,98 @@ void drawMochi(bool active) {
 
   int dx = (int)(faceLookX + faceDanceX);
   int dy = (int)(faceLookY + faceBob);
+  dx = constrain(dx, -10, 10);
+  dy = constrain(dy, -8, 8);
 
-  // --- 1. Set Target Face based on State ---
-  breathPhase += 0.002f;
-  if (breathPhase > 6.28f) breathPhase = 0.0f;
-  float breathe = sinf(breathPhase) * 0.8f; // gentle breathing offset
+  // --- 1. Map State to targetEmo ---
+  uint8_t newTargetEmo = 0; // NORMAL
 
   if (freefallUntilMs > millis()) {
-      // Freefall: Screaming O_O wide eyes
-      targetFace = {32.0f, 44.0f, 16.0f, 55.0f, -8.0f, 0.0f, 20.0f, 22.0f, 40.0f, -12.0f, 0.0f};
+      newTargetEmo = 5; // SURPRISED
   } else if (now < laughUntilMs) {
-      // Laughing: > < squinty eyes, huge D mouth
-      targetFace = {30.0f, 10.0f, 4.0f, 48.0f, -6.0f, 15.0f, 32.0f, 26.0f, 36.0f, 20.0f, 24.0f};
-      dy += (int)(sinf(now * 0.06f) * 4.0f); // laughing shake
+      newTargetEmo = 12; // LAUGHING
   } else if (now < glitchUntilMs) {
-      // Glitch: Flat wide eyes, straight mouth
-      targetFace = {36.0f, 6.0f, 0.0f, 50.0f, 0.0f, 0.0f, 28.0f, 4.0f, 38.0f, 0.0f, 0.0f};
-      dx += (int)(sinf(now * 0.1f) * 8.0f); // Fast horizontal shaking
+      newTargetEmo = 11; // DEAD (glitch representation)
   } else if (now < cryUntilMs) {
-      // Crying: Droopy heavy brows, trembling mouth
-      targetFace = {24.0f, 38.0f, 10.0f, 46.0f, 18.0f, -15.0f, 14.0f, 8.0f, 38.0f, -6.0f, 0.0f};
-      dy += (int)(sinf(now * 0.05f) * 2.0f);
+      newTargetEmo = 13; // CRYING
   } else if (now < pantUntilMs) {
-      // Panting: Squinty eyes, open mouth
-      targetFace = {26.0f, 16.0f, 6.0f, 48.0f, 5.0f, 5.0f, 20.0f, 24.0f, 36.0f, -4.0f, 0.0f};
-      dy += (int)(sinf(now * 0.03f) * 3.0f); // Heavy breathing
+      newTargetEmo = 16; // PAIN (panting)
   } else if (active || voice > 0.15f) {
-      // Music / Active: Happy squinting eyes, big smile
-      targetFace = {28.0f, 26.0f, 10.0f, 48.0f, 0.0f, 0.0f, 26.0f, 14.0f, 31.0f, 12.0f, 18.0f};
+      newTargetEmo = 20; // MUSICAL
   } else if (superAngryMode) {
-      // SUPER ANGRY (sustained shake) — extreme V-brows, hard frown, trembling
-      float tremble = sinf(now * 0.05f) * 2.0f; // rapid micro-trembler
-      targetFace = {30.0f, 40.0f, 10.0f, 50.0f,
-                    20.0f, 18.0f,
-                    24.0f, 10.0f, 37.0f, -8.0f, 0.0f};
-      dx += (int)tremble; dy += (int)(fabsf(tremble) * 0.5f);
+      newTargetEmo = 19; // RAGE
+      dx += (int)(sinf(now * 0.05f) * 2.0f); dy += (int)(fabsf(sinf(now * 0.05f)) * 1.0f);
   } else if (angryMode) {
-      // Angry: Hard angled brows matching Lopaka bitmap style
-      targetFace = {28.0f, 38.0f, 10.0f, 49.0f,
-                    18.0f, 16.0f,
-                    22.0f, 10.0f, 36.0f, -6.0f, 0.0f};
-  } else if (now < sadUntilMs) {
-      // Sad: Droopy brows, slight frown, looking down
-      targetFace = {24.0f, 35.0f, 10.0f, 46.0f, 12.0f, -10.0f, 18.0f, 6.0f, 37.0f, -3.0f, 0.0f};
+      newTargetEmo = 3; // ANGRY
+  } else if (now < sadUntilMs || faceDownMode) {
+      newTargetEmo = 2; // SAD
   } else if (now < surprisedUntilMs) {
-      // Surprised: Tall round eyes
-      targetFace = {22.0f, 42.0f, 11.0f, 50.0f, -6.0f, 0.0f, 10.0f, 16.0f, 38.0f, 0.0f, 0.0f};
+      newTargetEmo = 5; // SURPRISED
   } else if (nodding || touchHappy) {
-      // Happy: Squinty arch eyes, big smile
-      targetFace = {28.0f, 24.0f, 10.0f, 48.0f, 0.0f, 0.0f, 26.0f, 14.0f, 31.0f, 12.0f, 20.0f};
-  } else if (faceDownMode) {
-      // Sad/face down: Droopy
-      targetFace = {24.0f, 35.0f, 10.0f, 46.0f, 12.0f, -10.0f, 18.0f, 6.0f, 37.0f, -3.0f, 0.0f};
+      newTargetEmo = 1; // HAPPY
   } else if (now < dizzyUntilMs || headShakeDetected) {
-      // Dizzy: squished flat eyes (the swirl is handled in drawing below)
-      targetFace = {40.0f, 10.0f, 2.0f, 55.0f, 0.0f, 0.0f, 10.0f, 4.0f, 35.0f, 0.0f, 0.0f};
+      newTargetEmo = 18; // DIZZY
   } else if (touchSleepy) {
-      // Sleepy: Flat half-closed eyes with breathing
-      targetFace = {26.0f, 9.0f + breathe * 0.5f, 4.0f, 48.0f, 0.0f, 0.0f, 16.0f, 5.0f, 36.0f, 0.0f, 0.0f};
+      newTargetEmo = 6; // SLEEPY
   } else if (now < annoyedUntilMs) {
-      // Annoyed: Slightly lowered brows, flat mouth
-      targetFace = {26.0f, 32.0f, 9.0f, 48.0f, 7.0f, 5.0f, 18.0f, 6.0f, 35.0f, 0.0f, 0.0f};
+      newTargetEmo = 22; // BORED
   } else if (!active && now < micShoutUntilMs) {
-      // SHOUT/LOUD: Wide startled eyes, raised brows, big O mouth
-      targetFace = {26.0f, 40.0f + fabsf(sinf(now * 0.010f)) * 3.0f, 13.0f, 50.0f,
-                    -8.0f, 0.0f, 14.0f, 18.0f, 38.0f, 0.0f, 0.0f};
-      dy -= 3; // head pops up slightly
+      newTargetEmo = 8; // SCARED (startled)
+      dy -= 3;
   } else if (!active && now < micActiveUntilMs) {
-      // LISTENING / TALKING: Alert eyes, animated open mouth
-      float openness = 6.0f + micSmooth * 20.0f; // mouth opens with volume
-      float eyeW = 26.0f + micSmooth * 4.0f;
-      float eyeH = 34.0f + micSmooth * 6.0f;     // eyes widen when louder
-      targetFace = {eyeW, eyeH, 10.0f, 48.0f,
-                    0.0f, 0.0f,
-                    18.0f + micSmooth * 6.0f, openness, 36.0f,
-                    micSmooth * 4.0f, micSmooth * 6.0f};
+      newTargetEmo = 7; // EXCITED
+  } else if (touchLove) {
+      newTargetEmo = 4; // LOVE
+  } else if (coldMood > 0.3f) {
+      newTargetEmo = 16; // PAIN (shivering)
   } else {
-      // Normal or Idle Expressions
+      // Normal or Idle Expressions mapping
       switch (idleExpr) {
-        case 1: // Curious - head tilts implied by MPU, eyes slightly diff size
-          targetFace = {26.0f, 37.0f + breathe, 12.0f, 48.0f, 5.0f, 8.0f, 16.0f, 6.0f, 35.0f, 4.0f, 0.0f};
-          break;
-        case 2: // Shy - smaller eyes, look away with slight blush
-          targetFace = {24.0f, 28.0f + breathe, 12.0f, 46.0f, 0.0f, 0.0f, 14.0f, 5.0f, 37.0f, 2.0f, 12.0f};
-          dx -= 6; dy += 4;
-          break;
-        case 3: // Bored - half closed, looking down
-          targetFace = {26.0f, 16.0f + breathe, 8.0f, 48.0f, 0.0f, 0.0f, 18.0f, 4.0f, 35.0f, -2.0f, 0.0f};
-          dy += 6;
-          break;
-        case 4: // Excited - slightly larger, bright eyes
-          targetFace = {28.0f, 42.0f + breathe, 14.0f, 50.0f, -2.0f, 0.0f, 20.0f, 10.0f, 34.0f, 8.0f, 0.0f};
-          dy -= 2;
-          break;
-        case 5: // Squint - suspicious
-          targetFace = {24.0f, 10.0f + breathe, 4.0f, 46.0f, 2.0f, -2.0f, 14.0f, 4.0f, 36.0f, -1.0f, 0.0f};
-          break;
-        case 6: // Thinking - looking up and away
-          targetFace = {24.0f, 34.0f + breathe, 12.0f, 48.0f, 0.0f, 0.0f, 12.0f, 6.0f, 36.0f, 2.0f, 0.0f};
-          dx -= 5; dy -= 4;
-          break;
-        case 7: // Smug - slight smirk, one brow up
-          targetFace = {26.0f, 34.0f + breathe, 12.0f, 48.0f, 2.0f, 5.0f, 20.0f, 7.0f, 35.0f, 3.0f, 0.0f};
-          dx += 2;
-          break;
-        case 8: // BigEyes - soft, cute look
-          targetFace = {32.0f, 46.0f + breathe, 16.0f, 52.0f, -4.0f, 0.0f, 16.0f, 8.0f, 34.0f, 6.0f, 8.0f};
-          break;
-        case 9: // HalfClosed - relaxed
-          targetFace = {28.0f, 22.0f + breathe, 10.0f, 50.0f, 2.0f, 0.0f, 16.0f, 5.0f, 36.0f, 2.0f, 0.0f};
-          break;
-        default: // Normal with gentle breathing (taller, more pill-shaped eyes)
-          targetFace = {28.0f, 42.0f + breathe, 14.0f, 50.0f, 0.0f, 0.0f, 18.0f, 6.0f, 35.0f, 4.0f, 0.0f};
-          break;
+        case 1: newTargetEmo = 9; break; // CONFUSED
+        case 2: newTargetEmo = 10; break; // SMUG
+        case 3: newTargetEmo = 22; break; // BORED
+        case 4: newTargetEmo = 7; break; // EXCITED
+        case 5: newTargetEmo = 15; break; // ROLLING EYES
+        case 6: newTargetEmo = 23; break; // PROUD
+        case 7: newTargetEmo = 10; break; // SMUG
+        case 8: newTargetEmo = 1; break; // HAPPY
+        case 9: newTargetEmo = 6; break; // SLEEPY
+        default: newTargetEmo = 0; break; // NORMAL
       }
   }
 
-  if (curiousMode && idleExpr != 1) {
-      targetFace.browDrop = 5.0f;
-      targetFace.browAngle = 8.0f;
+  // Handle Morphing State Machine
+  if (newTargetEmo != targetEmo) {
+    if (!morphing) {
+        currentEmo = targetEmo;
+    } else {
+        // If already morphing, let it finish or snap it
+        // We'll just snap current to whatever intermediate frame it is to avoid complex mid-morph math
+        // But the PixelFace logic uses strict 0-MORPH_STEPS from `current` to `target`.
+        // Easiest is to snap to the old target and start new morph.
+        currentEmo = targetEmo; 
+    }
+    targetEmo = newTargetEmo;
+    morphStep = 0;
+    morphing = true;
   }
 
-  // --- 2. Smooth Interpolation ---
-  float easing = 0.25f;
-  currentFace.eyeW += (targetFace.eyeW - currentFace.eyeW) * easing;
-  currentFace.eyeH += (targetFace.eyeH - currentFace.eyeH) * easing;
-  currentFace.eyeR += (targetFace.eyeR - currentFace.eyeR) * easing;
-  currentFace.eyeSpacing += (targetFace.eyeSpacing - currentFace.eyeSpacing) * easing;
-  currentFace.browDrop += (targetFace.browDrop - currentFace.browDrop) * easing;
-  currentFace.browAngle += (targetFace.browAngle - currentFace.browAngle) * easing;
-  currentFace.mouthW += (targetFace.mouthW - currentFace.mouthW) * easing;
-  currentFace.mouthH += (targetFace.mouthH - currentFace.mouthH) * easing;
-  currentFace.mouthY += (targetFace.mouthY - currentFace.mouthY) * easing;
-  currentFace.mouthCurve += (targetFace.mouthCurve - currentFace.mouthCurve) * easing;
-  currentFace.cheekRise += (targetFace.cheekRise - currentFace.cheekRise) * easing;
-
-  // --- 3. Procedural Drawing ---
-  display.clearDisplay();
-  
-  int cx = SCREEN_WIDTH / 2 + dx;
-  int cy = SCREEN_HEIGHT / 2 + dy - 15; // Eyes base height
-  
-  // --- 3. Draw Eyes ---
-  // Dizzy: make eyes wobble/spin visually
-  float dizzyWobbleL = 0.0f, dizzyWobbleR = 0.0f;
-  if (now < dizzyUntilMs) {
-    float t = (float)(now % 800) / 800.0f; // 0→1 repeating cycle
-    dizzyWobbleL =  sinf(t * 6.28f) * 5.0f;   // left eye swings up-down
-    dizzyWobbleR = -sinf(t * 6.28f) * 5.0f;   // right eye opposite phase → "spiral" look
-  }
-
-  // Left Eye
-  int lx = cx - currentFace.eyeSpacing / 2;
-  int ly = cy + (int)dizzyWobbleL;
-  float actualLeftH = currentFace.eyeH;
-  bool doWinkLeft = isWinking && winkLeft;
-  bool doWinkRight = isWinking && !winkLeft;
-  if ((isBlinking || doWinkLeft) && (!dizzy && !touchSleepy)) {
-      float prog = doWinkLeft ? winkProgress : blinkProgress;
-      actualLeftH = currentFace.eyeH * (1.0f - prog) + 2.0f * prog;
-  }
-  display.fillRoundRect(lx - currentFace.eyeW/2, ly - actualLeftH/2, currentFace.eyeW, (int)actualLeftH, currentFace.eyeR, OLED_WHITE);
-
-  // Right Eye
-  int rx = cx + currentFace.eyeSpacing / 2;
-  int ry = cy + (int)dizzyWobbleR;
-  float actualRightH = currentFace.eyeH;
-  if ((isBlinking || doWinkRight) && (!dizzy && !touchSleepy)) {
-      float prog = doWinkRight ? winkProgress : blinkProgress;
-      actualRightH = currentFace.eyeH * (1.0f - prog) + 2.0f * prog;
-  }
-  display.fillRoundRect(rx - currentFace.eyeW/2, ry - actualRightH/2, currentFace.eyeW, (int)actualRightH, currentFace.eyeR, OLED_WHITE);
-
-  // Beat-sync eye squint during music (no pupils — just shape change)
-  if (active && voice > 0.3f) {
-    float beatPunch = fabsf(sinf(now * 0.0105f));
-    if (beatPunch > 0.82f) {
-      // Quick squint on beat — mask bottom half with black strip
-      int squintH = (int)(actualLeftH * 0.35f * voice);
-      display.fillRect(lx - currentFace.eyeW/2, ly + (int)(actualLeftH/2) - squintH,
-                       (int)currentFace.eyeW, squintH + 2, OLED_BLACK);
-      display.fillRect(rx - currentFace.eyeW/2, ry + (int)(actualRightH/2) - squintH,
-                       (int)currentFace.eyeW, squintH + 2, OLED_BLACK);
+  if (morphing) {
+    morphStep++;
+    if (morphStep >= MORPH_STEPS) {
+      morphStep = MORPH_STEPS;
+      morphing = false;
+      currentEmo = targetEmo;
     }
   }
 
-  // Blush dots for shy / love
-  if ((idleExpr == 2 || touchLove) && !active && !angryMode && !superAngryMode) {
-    drawBlushDots(lx - 4, ly + (int)(currentFace.eyeH * 0.7f));
-    drawBlushDots(rx + 4, ry + (int)(currentFace.eyeH * 0.7f));
-  }
+  // Render the Frame!
+  display.clearDisplay();
   
-  // Mouth
-  int mx = cx;
-  int my = cy + currentFace.mouthY;
-  display.fillRoundRect(mx - currentFace.mouthW/2, my - currentFace.mouthH/2, currentFace.mouthW, currentFace.mouthH, currentFace.mouthH/3, OLED_WHITE);
-  
-  // Masking for smiles/frowns on mouth
-  if (currentFace.mouthCurve > 0.5f) { // Smile: Mask top
-      display.fillCircle(mx, my - currentFace.mouthH/2 - currentFace.mouthCurve, currentFace.mouthW, OLED_BLACK);
-  } else if (currentFace.mouthCurve < -0.5f) { // Frown: Mask bottom
-      display.fillCircle(mx, my + currentFace.mouthH/2 - currentFace.mouthCurve, currentFace.mouthW, OLED_BLACK);
-  }
+  bool isBlinkingNow = (isBlinking && blinkProgress < 0.6f) || (isWinking && winkLeft && winkProgress < 0.6f);
+  // (Note: PixelFace handles only global blink lid=10. For full Wink we'd use WINK state, but we can just use normal blink logic)
 
-  // Masking for Happy Cheeks (bottom of eyes)
-  if (currentFace.cheekRise > 1.0f) {
-      display.fillCircle(lx, ly + currentFace.eyeH/2 + 15 - currentFace.cheekRise, 15, OLED_BLACK);
-      display.fillCircle(rx, ry + currentFace.eyeH/2 + 15 - currentFace.cheekRise, 15, OLED_BLACK);
-  }
-
-  // Masking for Angry/Sad Brows (Top of eyes using big triangles)
-  if (abs(currentFace.browDrop) > 1.0f || abs(currentFace.browAngle) > 1.0f) {
-      // Left brow
-      int l_tl_x = lx - 30, l_tl_y = ly - 40;
-      int l_tr_x = lx + 30, l_tr_y = ly - 40;
-      int l_bl_x = lx - 30, l_bl_y = ly - actualLeftH/2 + currentFace.browDrop - currentFace.browAngle;
-      int l_br_x = lx + 30, l_br_y = ly - actualLeftH/2 + currentFace.browDrop + currentFace.browAngle;
-      display.fillTriangle(l_tl_x, l_tl_y, l_tr_x, l_tr_y, l_bl_x, l_bl_y, OLED_BLACK);
-      display.fillTriangle(l_tr_x, l_tr_y, l_br_x, l_br_y, l_bl_x, l_bl_y, OLED_BLACK);
-
-      // Right brow (mirrored angle)
-      int r_tl_x = rx - 30, r_tl_y = ry - 40;
-      int r_tr_x = rx + 30, r_tr_y = ry - 40;
-      int r_bl_x = rx - 30, r_bl_y = ry - actualRightH/2 + currentFace.browDrop + currentFace.browAngle;
-      int r_br_x = rx + 30, r_br_y = ry - actualRightH/2 + currentFace.browDrop - currentFace.browAngle;
-      
-      display.fillTriangle(r_tl_x, r_tl_y, r_tr_x, r_tr_y, r_bl_x, r_bl_y, OLED_BLACK);
-      display.fillTriangle(r_tr_x, r_tr_y, r_br_x, r_br_y, r_bl_x, r_bl_y, OLED_BLACK);
-  }
-
-  // Panting Tongue
-  if (now < pantUntilMs) {
-      int tongueW = 8;
-      int tongueH = 10 + (int)(sinf(now * 0.05f) * 4.0f); // panting motion
-      display.fillRoundRect(mx - tongueW/2, my + currentFace.mouthH/2, tongueW, tongueH, 3, OLED_WHITE);
-      display.drawLine(mx, my + currentFace.mouthH/2, mx, my + currentFace.mouthH/2 + tongueH - 2, OLED_BLACK); // tongue line
-  }
-
-  // Crying Tears
-  if (now < cryUntilMs) {
-      float tearDrop = (float)(now % 1000) / 1000.0f; // 0 to 1
-      int tearY = ly + currentFace.eyeH/2 + (int)(tearDrop * 20.0f);
-      int tearSize = 4 - (int)(tearDrop * 2.0f);
-      if (tearSize > 0) {
-        display.fillCircle(lx - 5, tearY, tearSize, OLED_WHITE);
-        display.fillCircle(rx + 5, tearY, tearSize, OLED_WHITE);
-      }
-  }
-
-  // Glitch
-  if (now < glitchUntilMs) {
-      // draw random static lines
-      for(int i=0; i<5; i++) {
-          int gy = random(cy - 20, cy + 20);
-          display.drawLine(cx - 30, gy, cx + 30, gy, OLED_BLACK);
-          display.drawLine(cx - 32 + random(0, 5), gy + 1, cx + 28 + random(0, 5), gy + 1, OLED_WHITE);
-      }
-      display.setCursor(cx - 10, cy - 25);
-      display.setTextSize(1);
-      display.print("ERR");
-  }
-
-  // Zzz for sleepy
-  if (!dizzy && touchSleepy) {
-      display.setCursor(rx + 20, ry - 10);
-      display.setTextSize(1);
-      display.setTextColor(OLED_WHITE);
-      display.print("Zzz");
-      
-      // Anime Sleep Bubble
-      float bubbleAnim = sinf(now * 0.002f);
-      if (bubbleAnim > 0) {
-          int bubR = 4 + (int)(bubbleAnim * 8.0f);
-          display.drawCircle(mx + 10, my - 5, bubR, OLED_WHITE);
-          display.drawCircle(mx + 12, my - 7, bubR/3, OLED_WHITE); // reflection
-      }
-  }
+  renderEmotion(targetEmo, morphStep, currentEmo, isBlinkingNow, MORPH_STEPS, dx, dy, faceLookX, faceLookY);
 
   display.display();
 }
@@ -1608,13 +2451,27 @@ void drawMenu(const char* title, const char** options, int numOptions, int curso
   }
 }
 
+void enterDrawMode(bool clearCanvas = true) {
+  currentState = STATE_DRAW;
+  if (!oledReady) return;
+  if (clearCanvas) {
+    memset(drawFrame, 0, sizeof(drawFrame));
+    display.clearDisplay();
+    display.display();
+  }
+}
+
 void drawUI() {
   if (!oledReady) return;
+  if (currentState == STATE_DRAW) return;
   display.clearDisplay();
   
   if (currentState == STATE_MENU) {
-    const char* menuOpts[] = {"Games", "Dht", "Reminder", "Musik", "Kembali"};
-    drawMenu("MENU UTAMA", menuOpts, 5, menuCursor);
+    const char* menuOpts[] = {"Games", "Dht", "Reminder", "Musik", "Draw", "Kembali"};
+    drawMenu("MENU UTAMA", menuOpts, 6, menuCursor);
+  } else if (currentState == STATE_MUSIC) {
+    const char* musicOpts[] = {"Love Story", "MBG", "Hai", "Kembali"};
+    drawMenu("PILIH LAGU", musicOpts, 4, musicCursor);
   } else if (currentState == STATE_GAMES) {
     drawPingpong();
     return; // drawPingpong calls display.display() itself
@@ -1650,6 +2507,60 @@ void drawUI() {
     // Status bar
     display.setCursor(20, 54);
     display.print("[tap balik]");
+  } else if (currentState == STATE_CHAT) {
+    display.clearDisplay();
+    display.setFont(NULL);
+    display.setTextSize(1);
+    display.setTextColor(OLED_WHITE);
+
+    const uint16_t totalChars = strlen(chatText);
+    uint16_t visibleChars = (millis() - chatStartMs) / 24UL;
+    if (visibleChars > totalChars) visibleChars = totalChars;
+
+    int cursorX = 4;
+    int cursorY = 6;
+    uint16_t printed = 0;
+    for (uint16_t i = 0; i < totalChars && printed < visibleChars; i++) {
+      char c = chatText[i];
+      if (c == '\r') continue;
+      if (c == '\n') {
+        cursorX = 4;
+        cursorY += 10;
+        if (cursorY > 54) break;
+        continue;
+      }
+      if (c == ' ') {
+        uint16_t nextWordLen = 0;
+        for (uint16_t j = i + 1; j < totalChars && chatText[j] != ' ' && chatText[j] != '\n' && chatText[j] != '\r'; j++) {
+          nextWordLen++;
+        }
+        if (cursorX + 6 + (int)nextWordLen * 6 > 124) {
+          cursorX = 4;
+          cursorY += 10;
+          if (cursorY > 54) break;
+          printed++;
+          continue;
+        }
+      } else if (cursorX > 122) {
+        cursorX = 4;
+        cursorY += 10;
+        if (cursorY > 54) break;
+      }
+
+      display.setCursor(cursorX, cursorY);
+      display.write(c);
+      cursorX += 6;
+      printed++;
+    }
+
+    if (visibleChars >= totalChars && ((millis() / 360UL) % 2UL == 0) && cursorY <= 54) {
+      display.setCursor(cursorX, cursorY);
+      display.write('_');
+    }
+
+    if (visibleChars >= totalChars && millis() > chatDisplayUntilMs) {
+      currentState = STATE_FACE;
+    }
   } else if (currentState == STATE_REMINDER) {
     display.setTextSize(1);
     display.setTextColor(OLED_WHITE);
@@ -1734,6 +2645,8 @@ void acceptClient() {
   audioClient = next;
   audioClient.setNoDelay(true);
   ringReset();
+  currentState = STATE_FACE;
+  gamePhase = GAME_IDLE;
   totalBytes = 0;
   lastAudioMs = millis();
   Serial.println("audio client connected");
@@ -1756,6 +2669,15 @@ void readClientToRing() {
 }
 
 void writeAudioBlock() {
+  unsigned long now = millis();
+  if (playing && now - lastAudioMs > 1200UL && ringCount < AUDIO_PREBUFFER_BYTES) {
+    ringReset();
+    memset(stereoSamples, 0, sizeof(stereoSamples));
+    size_t written = 0;
+    i2s_write(I2S_NUM_0, stereoSamples, sizeof(stereoSamples), &written, portMAX_DELAY);
+    return;
+  }
+
   if (!playing) {
     if (ringCount < AUDIO_PREBUFFER_BYTES) {
       memset(stereoSamples, 0, sizeof(stereoSamples));
@@ -1766,7 +2688,7 @@ void writeAudioBlock() {
     playing = true;
   }
 
-  if (playing && ringCount < AUDIO_BLOCK_BYTES / 2 && millis() - lastAudioMs > 700UL) {
+  if (playing && ringCount < AUDIO_BLOCK_BYTES / 2 && now - lastAudioMs > 700UL) {
     playing = false;
   }
 
@@ -1777,7 +2699,6 @@ void writeAudioBlock() {
     int16_t sample;
     if (ringPopByte(lo) && ringPopByte(hi)) {
       sample = (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
-      sample = (int16_t)((int32_t)sample / 3);
       lastSample = sample;
       playedBytes += 2;
     } else {
@@ -1827,13 +2748,8 @@ void micTask(void *pvParameters) {
   uint8_t micBuf[1024];
   size_t bytesRead;
   while(true) {
-    if (i2s_read(I2S_NUM_0, micBuf, sizeof(micBuf), &bytesRead, portMAX_DELAY) == ESP_OK) {
+    if (i2s_read(I2S_NUM_0, micBuf, sizeof(micBuf), &bytesRead, 20 / portTICK_PERIOD_MS) == ESP_OK) {
       if (bytesRead > 0) {
-        // Broadcast mic audio to dashboard
-        micUdp.beginPacket(IPAddress(255,255,255,255), 7799);
-        micUdp.write(micBuf, bytesRead);
-        micUdp.endPacket();
-
         // --- Compute RMS of mic input for face expressions ---
         // INMP441 is 32-bit I2S, upper 24 bits used. Shift right 8.
         int32_t *samples32 = (int32_t*)micBuf;
@@ -1860,14 +2776,14 @@ void micTask(void *pvParameters) {
         if (micSmooth > 0.35f) micShoutUntilMs  = now + 800;
       }
     }
-    vTaskDelay(1);
+    vTaskDelay(8 / portTICK_PERIOD_MS);
   }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(700);
-  pinMode(TOUCH_PIN, INPUT);
+  pinMode(TOUCH_PIN, INPUT_PULLDOWN);
   Wire.begin(D4, D5);
   oledReady = display.begin(OLED_ADDR, true);
   if (oledReady) {
@@ -1888,7 +2804,6 @@ void setup() {
   audioServer.begin();
   audioServer.setNoDelay(true);
   Serial.println("TCP audio server on port 7777");
-  xTaskCreatePinnedToCore(micTask, "MicTask", 4096, NULL, 1, NULL, 0);
 }
 
 void handleSerial() {
@@ -1897,7 +2812,32 @@ void handleSerial() {
     cmd.trim();
     if (cmd.length() == 0) continue;
     unsigned long now = millis();
-    if (cmd.startsWith("J")) {
+    if (cmd.startsWith("H")) {
+      if (cmd.length() == 2049) {
+        bool ok = true;
+        for (int i = 0; i < 1024; i++) {
+          char c1 = cmd.charAt(1 + i * 2);
+          char c2 = cmd.charAt(2 + i * 2);
+          int hi = (c1 >= '0' && c1 <= '9') ? c1 - '0' : (c1 >= 'a' && c1 <= 'f') ? c1 - 'a' + 10 : (c1 >= 'A' && c1 <= 'F') ? c1 - 'A' + 10 : -1;
+          int lo = (c2 >= '0' && c2 <= '9') ? c2 - '0' : (c2 >= 'a' && c2 <= 'f') ? c2 - 'a' + 10 : (c2 >= 'A' && c2 <= 'F') ? c2 - 'A' + 10 : -1;
+          if (hi < 0 || lo < 0) {
+            ok = false;
+            break;
+          }
+          drawFrame[i] = (uint8_t)((hi << 4) | lo);
+        }
+        if (ok && oledReady) {
+          currentState = STATE_DRAW;
+          display.clearDisplay();
+          display.drawBitmap(0, 0, drawFrame, 128, 64, OLED_WHITE);
+          display.display();
+          Serial.println("cmd: Draw frame");
+        }
+      }
+    } else if (cmd == "W") {
+      enterDrawMode(true);
+      Serial.println("cmd: Draw mode");
+    } else if (cmd.startsWith("J")) {
       sscanf(cmd.c_str(), "J%d,%d", &manualJoyX, &manualJoyY);
       lastJoyMs = now;
     } else if (cmd.startsWith("M")) {
@@ -1918,7 +2858,9 @@ void handleSerial() {
         currentState = STATE_MENU;
         menuCursor = 0;
       } else if (currentState == STATE_MENU) {
-        menuCursor = (menuCursor + 1) % 5;
+        menuCursor = (menuCursor + 1) % 6;
+      } else if (currentState == STATE_MUSIC) {
+        musicCursor = (musicCursor + 1) % 4;
       } else if (currentState == STATE_GAMES) {
         if (gamePhase == GAME_IDLE || gamePhase == GAME_OVER) {
           initPingpong(true);
@@ -1937,14 +2879,32 @@ void handleSerial() {
         else if (menuCursor == 1) currentState = STATE_SENSOR;
         else if (menuCursor == 2) currentState = STATE_REMINDER;
         else if (menuCursor == 3) {
+          currentState = STATE_MUSIC;
+          musicCursor = 0;
+        }
+        else if (menuCursor == 4) enterDrawMode(true);
+        else if (menuCursor == 5) currentState = STATE_FACE;
+        if (currentState == STATE_GAMES) gamePhase = GAME_IDLE;
+      } else if (currentState == STATE_MUSIC) {
+        if (musicCursor == 0) {
           currentState = STATE_FACE;
           req_lovestory = true;
+          req_song = 1;
+        } else if (musicCursor == 1) {
+          currentState = STATE_FACE;
+          req_song = 2;
+        } else if (musicCursor == 2) {
+          currentState = STATE_FACE;
+          req_song = 3;
+        } else {
+          currentState = STATE_MENU;
+          menuCursor = 3;
         }
-        else if (menuCursor == 4) currentState = STATE_FACE;
-        if (currentState == STATE_GAMES) gamePhase = GAME_IDLE;
       } else if (currentState == STATE_GAMES) {
         currentState = STATE_FACE;
         gamePhase = GAME_IDLE;
+      } else if (currentState == STATE_DRAW) {
+        currentState = STATE_FACE;
       } else if (currentState == STATE_FACE) {
         touchSleepyUntilMs = now + 2600UL;
       }
@@ -1968,6 +2928,14 @@ void handleSerial() {
       int val = cmd.substring(1).toInt();
       manualJoyY = constrain(val, -100, 100);
       lastJoyMs = now;
+    } else if (cmd.startsWith("T:")) {
+      strncpy(chatText, cmd.c_str() + 2, sizeof(chatText) - 1);
+      chatText[sizeof(chatText) - 1] = '\0';
+      currentState = STATE_CHAT;
+      chatStartMs = now;
+      chatDisplayUntilMs = now + max(6000, (int)strlen(chatText) * 120 + 2500);
+      Serial.print("cmd: Chat -> ");
+      Serial.println(chatText);
     }
   }
 }
@@ -1985,7 +2953,7 @@ void loop() {
   readClientToRing();
 
   unsigned long now = millis();
-  unsigned long drawInterval = (currentState == STATE_GAMES) ? 25UL : (playing ? 40UL : 75UL);
+  unsigned long drawInterval = (currentState == STATE_GAMES) ? 25UL : (currentState == STATE_FACE ? 40UL : (currentState == STATE_CHAT ? 35UL : 60UL));
   if (playing != wasPlaying || now - lastDrawMs > drawInterval) {
     wasPlaying = playing;
     lastDrawMs = now;

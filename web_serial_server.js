@@ -3,14 +3,122 @@ const dgram = require("dgram");
 const net = require("net");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
+require("dotenv").config();
+const { GoogleGenAI } = require("@google/genai");
 
 const PORT = 3000;
 const SERIAL_PORT = process.env.SERIAL_PORT || "COM4";
 const BAUD = 115200;
+const AI_DAILY_LIMIT = Number(process.env.AI_DAILY_LIMIT || 30);
+const AI_PROVIDER = String(process.env.AI_PROVIDER || "gemini").toLowerCase();
+const KOBOLLM_BASE_URL = (process.env.KOBOLLM_BASE_URL || process.env.KOBOILLM_BASE_URL || "https://lite.koboillm.com/v1").replace(/\/+$/, "");
+const KOBOLLM_MODEL = process.env.KOBOLLM_MODEL || process.env.KOBOILLM_MODEL || "openai/gpt-4o-mini";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const AI_MAX_TOKENS = Number(process.env.AI_MAX_TOKENS || 256);
+const OWI_SYSTEM_PROMPT = "Kamu adalah Owi, robot desktop kecil yang lucu, ceria, dan sedikit jail. Jawab bahasa Indonesia santai, ramah, dan singkat. Maksimal 1-2 kalimat pendek agar muat di OLED 128x64. Jawab langsung tanpa proses berpikir.";
 
 let serial = null;
 let serialJustOpened = false;
 const logs = [];
+let aiUsage = { date: new Date().toISOString().slice(0, 10), count: 0 };
+
+function getKoboiKey() {
+  return process.env.KOBOLLM_API_KEY || process.env.KOBOILLM_API_KEY || "";
+}
+
+function getGeminiKey() {
+  return process.env.GEMINI_API_KEY || "";
+}
+
+let geminiChat = null;
+try {
+  if (getGeminiKey()) {
+    const ai = new GoogleGenAI({ apiKey: getGeminiKey() });
+    geminiChat = ai.chats.create({
+      model: GEMINI_MODEL,
+      config: {
+        systemInstruction: OWI_SYSTEM_PROMPT
+      }
+    });
+  }
+} catch (e) {
+  console.log("Gemini initialization failed:", e.message);
+}
+
+function getAiLimitStatus() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (aiUsage.date !== today) aiUsage = { date: today, count: 0 };
+  return {
+    date: aiUsage.date,
+    used: aiUsage.count,
+    limit: AI_DAILY_LIMIT,
+    remaining: Math.max(0, AI_DAILY_LIMIT - aiUsage.count),
+    enabled: !!(getKoboiKey() || getGeminiKey()),
+    provider: getGeminiKey() && AI_PROVIDER !== "kobollm" && AI_PROVIDER !== "koboillm" ? "Gemini" : (getKoboiKey() ? "KoboiLLM" : "off"),
+    model: getGeminiKey() && AI_PROVIDER !== "kobollm" && AI_PROVIDER !== "koboillm" ? GEMINI_MODEL : (getKoboiKey() ? KOBOLLM_MODEL : ""),
+  };
+}
+
+function sanitizeOledText(text) {
+  let cleaned = String(text || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  cleaned = cleaned.replace(/[^\x20-\x7E]/g, "");
+  if (cleaned.length > 200) cleaned = cleaned.substring(0, 197) + "...";
+  return cleaned || "Aku belum dapat jawabannya.";
+}
+
+async function askKoboiLLM(userMsg) {
+  const key = getKoboiKey();
+  if (!key) throw new Error("KOBOLLM_API_KEY belum ada di .env");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25000);
+  try {
+    const response = await fetch(`${KOBOLLM_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model: KOBOLLM_MODEL,
+        temperature: 0.7,
+        max_tokens: AI_MAX_TOKENS,
+        messages: [
+          { role: "system", content: OWI_SYSTEM_PROMPT },
+          { role: "user", content: userMsg },
+        ],
+      }),
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const msg = data?.error?.message || data?.message || `KoboiLLM HTTP ${response.status}`;
+      throw new Error(msg);
+    }
+    return data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || "";
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function askGemini(userMsg) {
+  if (!getGeminiKey() || !geminiChat) throw new Error("GEMINI_API_KEY belum ada di .env");
+  const response = await geminiChat.sendMessage({ message: userMsg });
+  return response.text || "";
+}
+
+async function askOwi(userMsg) {
+  if ((AI_PROVIDER === "kobollm" || AI_PROVIDER === "koboillm") && getKoboiKey()) {
+    return { provider: "KoboiLLM", model: KOBOLLM_MODEL, text: await askKoboiLLM(userMsg) };
+  }
+  if (getGeminiKey()) return { provider: "Gemini", model: GEMINI_MODEL, text: await askGemini(userMsg) };
+  if (getKoboiKey()) return { provider: "KoboiLLM", model: KOBOLLM_MODEL, text: await askKoboiLLM(userMsg) };
+  throw new Error("API key belum dipasang. Buat .env lalu isi KOBOLLM_API_KEY atau GEMINI_API_KEY.");
+}
 
 let latestTelemetry = {};
 const udpServer = dgram.createSocket("udp4");
@@ -19,8 +127,14 @@ udpServer.on("message", (msg, rinfo) => {
     latestTelemetry = JSON.parse(msg.toString());
     latestTelemetry.lastUpdate = Date.now();
     latestTelemetry.ip = rinfo.address;
-    if (latestTelemetry.req_lovestory === 1 && !isStreamingAudio) {
-      streamAudio(latestTelemetry.ip, "0.06", "lovestory.mp3");
+    if (!isStreamingAudio) {
+      if (latestTelemetry.req_song === 1 || latestTelemetry.req_lovestory === 1) {
+        streamAudio(latestTelemetry.ip, "0.28", "lovestory.mp3");
+      } else if (latestTelemetry.req_song === 2) {
+        streamAudio(latestTelemetry.ip, "0.32", "mbg.mp3");
+      } else if (latestTelemetry.req_song === 3) {
+        streamAudio(latestTelemetry.ip, "0.45", "hai_owi.wav");
+      }
     }
   } catch(e){}
 });
@@ -28,7 +142,13 @@ udpServer.bind(7788);
 
 let isStreamingAudio = false;
 
-async function streamAudio(ip, volume = "0.06", mp3Path = "lovestory.mp3") {
+function clampVolume(value, fallback = 0.22) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0.04, Math.min(0.55, parsed));
+}
+
+async function streamAudio(ip, volume = "0.30", mp3Path = "lovestory.mp3") {
   if (isStreamingAudio) return;
   if (!ip) return;
   isStreamingAudio = true;
@@ -38,7 +158,8 @@ async function streamAudio(ip, volume = "0.06", mp3Path = "lovestory.mp3") {
     const port = 7777;
     const sampleRate = 16000;
     const bytesPerSecond = sampleRate * 2;
-    const chunkSize = 1024;
+    const safeVolume = clampVolume(volume).toFixed(2);
+    const chunkSize = 512;
 
     const socket = net.createConnection({ host: ip, port });
     socket.setNoDelay(true);
@@ -55,7 +176,7 @@ async function streamAudio(ip, volume = "0.06", mp3Path = "lovestory.mp3") {
       "-acodec", "pcm_s16le",
       "-ac", "1",
       "-ar", String(sampleRate),
-      "-filter:a", `highpass=f=150,lowpass=f=7500,volume=${volume}`,
+      "-filter:a", `highpass=f=95,lowpass=f=7200,loudnorm=I=-20:TP=-2.5:LRA=8,acompressor=threshold=-24dB:ratio=2.2:attack=18:release=240,alimiter=limit=0.38,volume=${safeVolume}`,
       "pipe:1",
     ], { stdio: ["ignore", "pipe", "pipe"] });
 
@@ -90,6 +211,63 @@ async function streamAudio(ip, volume = "0.06", mp3Path = "lovestory.mp3") {
   }
 }
 
+async function streamTestTone(ip, volume = "0.35") {
+  if (isStreamingAudio) return;
+  if (!ip) return;
+  isStreamingAudio = true;
+  const safeVolume = clampVolume(volume, 0.35);
+  logEvent(`test MAX tone ke ${ip}:7777 vol ${safeVolume.toFixed(2)}`);
+
+  try {
+    const port = 7777;
+    const sampleRate = 16000;
+    const durationMs = 1800;
+    const frequency = 880;
+    const frames = Math.floor(sampleRate * durationMs / 1000);
+    const chunkFrames = 256;
+    const leadBytes = 4096;
+    let sent = 0;
+    let started = Date.now();
+
+    const socket = net.createConnection({ host: ip, port });
+    socket.setNoDelay(true);
+    await new Promise((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+
+    for (let frame = 0; frame < frames; frame += chunkFrames) {
+      const n = Math.min(chunkFrames, frames - frame);
+      const chunk = Buffer.alloc(n * 2);
+      for (let i = 0; i < n; i++) {
+        const t = (frame + i) / sampleRate;
+        const envelope = Math.min(1, Math.min((frame + i) / 1200, (frames - frame - i) / 1200));
+        const sample = Math.round(Math.sin(2 * Math.PI * frequency * t) * 26000 * safeVolume * envelope);
+        chunk.writeInt16LE(sample, i * 2);
+      }
+
+      await new Promise((resolve, reject) => socket.write(chunk, (err) => err ? reject(err) : resolve()));
+      sent += chunk.length;
+      if (sent > leadBytes) {
+        const targetMs = ((sent - leadBytes) / (sampleRate * 2)) * 1000;
+        const elapsedMs = Date.now() - started;
+        const waitMs = targetMs - elapsedMs;
+        if (waitMs > 1) await sleep(Math.min(waitMs, 18));
+      } else {
+        started = Date.now();
+      }
+    }
+
+    await sleep(250);
+    socket.end();
+  } catch (err) {
+    logEvent(`test MAX err: ${err.message}`);
+  } finally {
+    isStreamingAudio = false;
+    logEvent("test MAX selesai");
+  }
+}
+
 function logEvent(message) {
   const line = `${new Date().toLocaleTimeString()} ${message}`;
   logs.push(line);
@@ -99,6 +277,28 @@ function logEvent(message) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function timedSerialOperation(label, ms, executor) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`${label} timeout`));
+    }, ms);
+    const finish = (err, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      err ? reject(err) : resolve(value);
+    };
+    try {
+      executor(finish);
+    } catch (err) {
+      finish(err);
+    }
+  });
 }
 
 function closeSerial() {
@@ -113,33 +313,36 @@ function closeSerial() {
 
 async function openSerial() {
   if (serial && serial.isOpen && serial.writable) return serial;
+  if (serial) await closeSerial();
   logEvent(`open ${SERIAL_PORT}`);
   const { SerialPort } = await import("serialport");
-  serial = new SerialPort({ path: SERIAL_PORT, baudRate: BAUD, autoOpen: false, rtscts: false });
-  serial.on("error", () => {
+  const nextPort = new SerialPort({ path: SERIAL_PORT, baudRate: BAUD, autoOpen: false, rtscts: false });
+  serial = nextPort;
+  nextPort.on("error", () => {
     logEvent("serial error");
-    serial = null;
+    if (serial === nextPort) serial = null;
+    if (nextPort.isOpen) nextPort.close(() => {});
   });
-  await new Promise((resolve, reject) => {
-    serial.open((err) => (err ? reject(err) : resolve()));
+  await timedSerialOperation("serial open", 2500, (done) => {
+    nextPort.open((err) => done(err));
   });
-  await new Promise((resolve) => {
-    serial.set({ dtr: false, rts: false }, () => resolve());
+  await timedSerialOperation("serial set", 1200, (done) => {
+    nextPort.set({ dtr: false, rts: false }, (err) => done(err));
   });
   serialJustOpened = true;
   logEvent("serial opened");
-  return serial;
+  return nextPort;
 }
 
 function writeChunk(port, chunk) {
-  return new Promise((resolve, reject) => {
+  return timedSerialOperation("serial write", 1800, (done) => {
     if (!port || !port.isOpen || !port.writable) {
-      reject(new Error("Serial belum siap, coba klik lagi."));
+      done(new Error("Serial belum siap, coba klik lagi."));
       return;
     }
     port.write(chunk, (err) => {
-      if (err) return reject(err);
-      port.drain((drainErr) => (drainErr ? reject(drainErr) : resolve()));
+      if (err) return done(err);
+      port.drain((drainErr) => done(drainErr));
     });
   });
 }
@@ -180,36 +383,26 @@ async function sendToSerial(buffer) {
     await closeSerial();
     await sleep(250);
     await sendPacket(packet, { chunkSize: 128, chunkDelay: 1, openDelay: 180 });
-  } finally {
-    await sleep(20);
-    await closeSerial();
-    logEvent("serial closed");
   }
 }
 
 async function sendCommand(command) {
-  const allowed = new Set(["C", "M", "R", "T", "G", "F", "P", "O", "D", "E", "L", "1", "2"]);
+  const allowed = new Set(["C", "M", "R", "T", "G", "F", "P", "O", "D", "E", "L", "W", "1", "2"]);
   if (!allowed.has(command)) throw new Error("Command tidak valid");
   logEvent(`cmd ${command}`);
-  try {
-    await sendPacket(Buffer.from(command + "\n"), { chunkSize: 8, chunkDelay: 0, openDelay: 40 });
-  } finally {
-    await sleep(10);
-    await closeSerial();
-    logEvent("serial closed");
-  }
+  await sendPacket(Buffer.from(command + "\n"), { chunkSize: 8, chunkDelay: 0, openDelay: 40 });
+}
+
+async function sendChatText(text) {
+  const clean = sanitizeOledText(text).slice(0, 200);
+  logEvent(`chat "${clean}"`);
+  await sendPacket(Buffer.from("T:" + clean + "\n", "ascii"), { chunkSize: 48, chunkDelay: 0, openDelay: 40 });
 }
 
 async function sendReminderText(text) {
   const clean = String(text || "").replace(/[^\x20-\x7E]/g, "").trim().slice(0, 32) || "enroll lagi ya deck";
   logEvent(`reminder "${clean}"`);
-  try {
-    await sendPacket(Buffer.from("S" + clean + "\n", "ascii"), { chunkSize: 34, chunkDelay: 0, openDelay: 40 });
-  } finally {
-    await sleep(10);
-    await closeSerial();
-    logEvent("serial closed");
-  }
+  await sendPacket(Buffer.from("S" + clean + "\n", "ascii"), { chunkSize: 34, chunkDelay: 0, openDelay: 40 });
 }
 
 async function sendReminderSchedule(time, text) {
@@ -217,13 +410,7 @@ async function sendReminderSchedule(time, text) {
   const clean = String(text || "").replace(/[^\x20-\x7E]/g, "").trim().slice(0, 32) || "enroll lagi ya deck";
   const payload = `${safeTime}|${clean}`;
   logEvent(`reminder ${payload}`);
-  try {
-    await sendPacket(Buffer.from("S" + payload + "\n", "ascii"), { chunkSize: 40, chunkDelay: 0, openDelay: 40 });
-  } finally {
-    await sleep(10);
-    await closeSerial();
-    logEvent("serial closed");
-  }
+  await sendPacket(Buffer.from("S" + payload + "\n", "ascii"), { chunkSize: 40, chunkDelay: 0, openDelay: 40 });
 }
 
 async function sendReminderSchedules(reminders) {
@@ -236,13 +423,7 @@ async function sendReminderSchedules(reminders) {
   if (payloadItems.length === 0) payloadItems.push("07:30|enroll lagi ya deck");
   const payload = `A:${payloadItems.join(";")}`;
   logEvent(`reminders ${payloadItems.length}`);
-  try {
-    await sendPacket(Buffer.from("S" + payload + "\n", "ascii"), { chunkSize: 96, chunkDelay: 0, openDelay: 40 });
-  } finally {
-    await sleep(10);
-    await closeSerial();
-    logEvent("serial closed");
-  }
+  await sendPacket(Buffer.from("S" + payload + "\n", "ascii"), { chunkSize: 96, chunkDelay: 0, openDelay: 40 });
 }
 
 function pageHtml() {
@@ -703,15 +884,23 @@ function controlPageHtml() {
             <span id="menuStateLabel" class="badge" style="background:#000;color:var(--success);">--</span>
           </div>
           <div class="row" style="margin-bottom:0.8rem;">
-            <button class="primary" data-cmd="P">TAP (NEXT)</button>
-            <button class="primary" data-cmd="O">HOLD (OK)</button>
-            <button data-cmd="E">PET</button>
-            <button id="btnLoveStory" class="blue">&#9835; LOVE STORY</button>
-            <button id="btnMbg" class="blue">&#9835; MBG</button>
+            <button type="button" class="primary" data-cmd="P">TAP (NEXT)</button>
+            <button type="button" class="primary" data-cmd="O">HOLD (OK)</button>
+            <button type="button" data-cmd="E">PET</button>
+            <button type="button" id="btnLoveStory" class="blue">&#9835; LOVE STORY</button>
+            <button type="button" id="btnMbg" class="blue">&#9835; MBG</button>
+            <button type="button" id="btnTestMax">TEST MAX</button>
           </div>
           <div class="row" style="margin-bottom:0.8rem;">
             <span style="font-size:0.7rem;font-weight:700;font-family:'Roboto Mono',monospace;">VOL MUSIK:</span>
-            <input type="range" id="volLoveStory" min="1" max="100" value="50" style="width:100px;">
+            <input type="range" id="volLoveStory" min="4" max="55" value="30" style="width:100px;">
+          </div>
+          <div style="border:var(--border);padding:0.7rem;margin-bottom:0.8rem;background:#fff7d1;box-shadow:2px 2px 0 #000;">
+            <div style="font-family:'Roboto Mono',monospace;font-size:0.7rem;font-weight:900;margin-bottom:0.4rem;">AI LIMIT HARI INI</div>
+            <div class="row" style="gap:0.5rem;">
+              <span id="aiLimitBadge" class="badge">AI: --</span>
+              <span id="aiKeyBadge" class="badge">KEY: --</span>
+            </div>
           </div>
           <div id="status" class="status-bar">SYSTEM READY</div>
         </div>
@@ -764,7 +953,33 @@ function controlPageHtml() {
         </div>
       </div>
       <div class="panel" style="grid-column:1/-1;">
+        <h3>DRAW OLED</h3>
+        <div class="row" style="align-items:flex-start;">
+          <canvas id="drawCanvas" width="128" height="64" style="width:512px;max-width:100%;image-rendering:pixelated;background:#000;border:var(--border);box-shadow:var(--shadow);touch-action:none;"></canvas>
+          <div style="display:flex;flex-direction:column;gap:0.7rem;min-width:170px;">
+            <button type="button" id="enterDraw" class="primary">MASUK DRAW</button>
+            <button type="button" id="clearDraw">CLEAR</button>
+            <button type="button" id="drawBack" class="sm" data-cmd="C">BALIK WAJAH</button>
+            <div id="drawSyncState" style="font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:900;color:var(--success);">LIVE DRAW SIAP</div>
+            <label style="font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:800;">BRUSH
+              <input type="range" id="brushSize" min="1" max="7" value="3" style="width:100%;margin-top:0.4rem;">
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="panel" style="grid-column:1/-1;">
         <h3>&#127908; SPEECH RECOGNITION (INMP441)</h3>
+        <div style="display:grid;grid-template-columns:120px 1fr 74px;gap:0.7rem;align-items:center;margin-bottom:0.8rem;">
+          <div style="font-family:'Roboto Mono',monospace;font-size:0.75rem;font-weight:800;">MIC LEVEL</div>
+          <div style="height:14px;border:var(--border);background:#111;overflow:hidden;">
+            <div id="inmpLevelBar" style="height:100%;width:0%;background:linear-gradient(90deg,#37ff8b,#ffe66d,#ff5b7c);transition:width 90ms linear;"></div>
+          </div>
+          <div id="inmpLevelText" style="font-family:'Roboto Mono',monospace;font-size:0.8rem;font-weight:900;text-align:right;">0%</div>
+        </div>
+        <div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:0.8rem;">
+          <span id="inmpActiveBadge" class="gesture-badge">IDLE</span>
+          <span id="inmpPeakBadge" class="gesture-badge">PEAK 0%</span>
+        </div>
         <div class="row" style="margin-bottom:0.8rem;">
           <button id="startSpeech" class="primary">MULAI DENGAR</button>
           <button id="stopSpeech" class="sm">STOP</button>
@@ -772,6 +987,17 @@ function controlPageHtml() {
         </div>
         <div id="speechLive" style="font-family:'Roboto Mono',monospace;font-weight:700;font-size:1.1rem;min-height:2rem;padding:0.8rem;border:var(--border);background:#000;color:var(--success);margin-bottom:0.8rem;text-transform:none;">...</div>
         <div id="speechLog" style="font-family:'Roboto Mono',monospace;font-size:0.75rem;max-height:150px;overflow-y:auto;padding:0.5rem;border:var(--border);background:#f9f9f9;text-transform:none;color:#333;"></div>
+      </div>
+      <div class="panel" style="grid-column:1/-1;">
+        <h3>&#129302; CHATBOT OWI (GEMINI)</h3>
+        <p style="font-size:0.8rem;margin-bottom:0.8rem;color:#555;">Ketik atau pakai tombol dengar. Owi akan paham lewat model Gemini dan jawab langsung ke OLED.</p>
+        <div id="chatHistory" style="font-family:sans-serif;font-size:0.85rem;height:180px;overflow-y:auto;padding:0.5rem;border:var(--border);background:#fff;margin-bottom:0.8rem;display:flex;flex-direction:column;gap:0.5rem;">
+          <!-- chat messages -->
+        </div>
+        <div style="display:flex;gap:0.5rem;">
+          <input type="text" id="chatInput" placeholder="Ketik pesan..." style="flex:1;padding:0.5rem;border:var(--border);font-family:inherit;font-size:0.9rem;">
+          <button id="sendChatBtn" class="primary" style="padding:0 1rem;">KIRIM</button>
+        </div>
       </div>
     </section>
   </main>
@@ -807,25 +1033,123 @@ function controlPageHtml() {
     };
     addReminderRow();
 
-    document.getElementById('btnLoveStory').onclick = async () => {
+    async function playMusicClick(ev, file) {
+      ev.preventDefault();
+      ev.stopPropagation();
       try {
         const vol = document.getElementById('volLoveStory').value;
-        const r = await fetch('/play_audio', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ volume: (vol/100).toFixed(2), file: 'lovestory.mp3' }) });
+        const r = await fetch('/play_audio', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ volume: (vol/100).toFixed(2), file }) });
+        setStatus(await r.text());
+      } catch(e) { setStatus(e.message, true); }
+    }
+    document.getElementById('btnLoveStory').onclick = (ev) => playMusicClick(ev, 'lovestory.mp3');
+    document.getElementById('btnMbg').onclick = (ev) => playMusicClick(ev, 'mbg.mp3');
+    document.getElementById('btnTestMax').onclick = async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      try {
+        const vol = document.getElementById('volLoveStory').value;
+        const r = await fetch('/test_max', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ volume: (vol/100).toFixed(2) }) });
         setStatus(await r.text());
       } catch(e) { setStatus(e.message, true); }
     };
-    document.getElementById('btnMbg').onclick = async () => {
-      try {
-        const vol = document.getElementById('volLoveStory').value;
-        const r = await fetch('/play_audio', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ volume: (vol/100).toFixed(2), file: 'mbg.mp3' }) });
-        setStatus(await r.text());
-      } catch(e) { setStatus(e.message, true); }
-    };
+
+    const drawCanvas=document.getElementById('drawCanvas');
+    const drawCtx=drawCanvas.getContext('2d',{willReadFrequently:true});
+    const drawSyncState=document.getElementById('drawSyncState');
+    drawCtx.fillStyle='#000';drawCtx.fillRect(0,0,128,64);
+    drawCtx.strokeStyle='#fff';drawCtx.fillStyle='#fff';drawCtx.lineCap='round';drawCtx.lineJoin='round';
+    let drawing=false,lastPt=null,drawModeReady=false,drawSyncTimer=null,drawSyncBusy=false,drawSyncPending=false;
+    function setDrawSyncState(text,bad){
+      drawSyncState.textContent=text;
+      drawSyncState.style.color=bad?'var(--danger)':'var(--success)';
+    }
+    async function enterDrawMode(){
+      if(drawModeReady)return;
+      const r=await fetch('/cmd/W',{method:'POST'});
+      const text=await r.text();
+      if(!r.ok)throw new Error(text||'Gagal masuk draw');
+      drawModeReady=true;
+      setDrawSyncState('LIVE DRAW AKTIF',false);
+    }
+    function canvasPoint(ev){
+      const r=drawCanvas.getBoundingClientRect();
+      const src=ev.touches&&ev.touches[0]?ev.touches[0]:ev;
+      return {x:Math.max(0,Math.min(127,Math.floor((src.clientX-r.left)*128/r.width))),y:Math.max(0,Math.min(63,Math.floor((src.clientY-r.top)*64/r.height)))};
+    }
+    function drawAt(pt){
+      const b=Number(document.getElementById('brushSize').value||3);
+      drawCtx.lineWidth=b;
+      drawCtx.strokeStyle='#fff';drawCtx.fillStyle='#fff';
+      if(lastPt){drawCtx.beginPath();drawCtx.moveTo(lastPt.x,lastPt.y);drawCtx.lineTo(pt.x,pt.y);drawCtx.stroke();}
+      drawCtx.beginPath();drawCtx.arc(pt.x,pt.y,Math.max(0.5,b/2),0,Math.PI*2);drawCtx.fill();
+      lastPt=pt;
+      scheduleDrawSync();
+    }
+    function down(ev){ev.preventDefault();drawing=true;lastPt=null;drawAt(canvasPoint(ev));}
+    function move(ev){if(!drawing)return;ev.preventDefault();drawAt(canvasPoint(ev));}
+    function up(){drawing=false;lastPt=null;}
+    drawCanvas.addEventListener('pointerdown',down);
+    drawCanvas.addEventListener('pointermove',move);
+    window.addEventListener('pointerup',up);
+    drawCanvas.addEventListener('touchstart',down,{passive:false});
+    drawCanvas.addEventListener('touchmove',move,{passive:false});
+    window.addEventListener('touchend',up);
+    function canvasToOledBytes(){
+      const img=drawCtx.getImageData(0,0,128,64).data;
+      const out=new Uint8Array(1024);
+      for(let y=0;y<64;y++){
+        for(let xb=0;xb<16;xb++){
+          let v=0;
+          for(let bit=0;bit<8;bit++){
+            const x=xb*8+bit;
+            const idx=(y*128+x)*4;
+            const on=img[idx]+img[idx+1]+img[idx+2]>384;
+            if(on)v|=(0x80>>bit);
+          }
+          out[y*16+xb]=v;
+        }
+      }
+      return out;
+    }
+    async function sendDrawFrame(showStatus){
+      await enterDrawMode();
+      const bytes=canvasToOledBytes();
+      const r=await fetch('/frame',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:bytes});
+      const text=await r.text();
+      if(!r.ok)throw new Error(text||'Frame gagal');
+      if(showStatus)setStatus(text,false);
+      setDrawSyncState('LIVE SYNC '+new Date().toLocaleTimeString('id-ID',{hour12:false}),false);
+    }
+    function scheduleDrawSync(){
+      drawSyncPending=true;
+      if(drawSyncTimer)return;
+      drawSyncTimer=setTimeout(flushDrawSync,140);
+    }
+    async function flushDrawSync(){
+      drawSyncTimer=null;
+      if(drawSyncBusy)return;
+      if(!drawSyncPending)return;
+      drawSyncPending=false;
+      drawSyncBusy=true;
+      try{await sendDrawFrame(false);}
+      catch(e){setDrawSyncState(e.message,true);}
+      finally{
+        drawSyncBusy=false;
+        if(drawSyncPending)scheduleDrawSync();
+      }
+    }
+    document.getElementById('enterDraw').onclick=async()=>{try{drawModeReady=false;await enterDrawMode();await sendDrawFrame(true);}catch(e){setStatus(e.message,true);setDrawSyncState(e.message,true);}};
+    document.getElementById('clearDraw').onclick=async()=>{drawCtx.fillStyle='#000';drawCtx.fillRect(0,0,128,64);try{await sendDrawFrame(true);}catch(e){setStatus(e.message,true);setDrawSyncState(e.message,true);}};
 
     document.querySelectorAll('[data-cmd]').forEach(btn=>btn.onclick=async()=>{
       try{
         let r = await fetch('/cmd/'+btn.dataset.cmd,{method:'POST'});
         setStatus(await r.text());
+        if(btn.dataset.cmd==='C'){
+          drawModeReady=false;
+          setDrawSyncState('LIVE DRAW SIAP',false);
+        }
       }catch(e){setStatus(e.message,true);}
     });
     document.getElementById('logoutBtn').onclick=()=>{localStorage.removeItem('owi_current_user');location.href='/';};
@@ -841,6 +1165,15 @@ function controlPageHtml() {
         const inmpPct=s.inmp||0;
         bInmp.textContent='INMP: '+inmpPct+'%';
         bInmp.className='badge '+(inmpPct>0?'ok':'');
+        const inmpPeak=s.inmpPeak||0;
+        document.getElementById('inmpLevelBar').style.width=Math.max(0,Math.min(100,inmpPct))+'%';
+        document.getElementById('inmpLevelText').textContent=inmpPct+'%';
+        const inmpActive=document.getElementById('inmpActiveBadge');
+        inmpActive.textContent=s.micActive?'MENDENGAR':'IDLE';
+        inmpActive.classList.toggle('on',!!s.micActive);
+        const inmpPeakEl=document.getElementById('inmpPeakBadge');
+        inmpPeakEl.textContent='PEAK '+inmpPeak+'%';
+        inmpPeakEl.classList.toggle('on',inmpPeak>25);
         const bMax=document.getElementById('badgeMax');
         bMax.textContent=(s.max==1?'🔊 MAX: PLAY':'🔈 MAX: IDLE');
         bMax.className='badge '+(s.max==1?'active':'');
@@ -859,7 +1192,7 @@ function controlPageHtml() {
           document.getElementById('faceLabel').textContent=s.expr;
         }
 
-        const stateMap = ["WAJAH NORMAL", "MENU UTAMA", "GAMES PINGPONG", "SENSOR SUHU", "REMINDER ALARM"];
+        const stateMap = ["WAJAH NORMAL", "MENU UTAMA", "GAMES PINGPONG", "SENSOR SUHU", "REMINDER ALARM", "DRAW OLED", "PILIH LAGU"];
         if(s.state !== undefined && s.state >= 0 && s.state < stateMap.length) {
           document.getElementById('menuStateLabel').textContent = stateMap[s.state];
         }
@@ -874,6 +1207,20 @@ function controlPageHtml() {
       }catch(e){}
     }
     setInterval(refreshSensors,250);
+
+    async function refreshAiLimit(){
+      try{
+        const r=await fetch('/api/ai-limit');const s=await r.json();
+        const b=document.getElementById('aiLimitBadge');
+        b.textContent='AI: '+s.used+'/'+s.limit+' SISA '+s.remaining;
+        b.className='badge '+(s.remaining<=3?'err':s.remaining<=8?'active':'ok');
+        const k=document.getElementById('aiKeyBadge');
+        k.textContent=s.enabled?'KEY: SIAP':'KEY: BELUM';
+        k.className='badge '+(s.enabled?'ok':'err');
+      }catch(e){}
+    }
+    refreshAiLimit();
+    setInterval(refreshAiLimit,5000);
 
     // ─── SPEECH RECOGNITION (Web Speech API - id-ID) ───
     let recognition = null;
@@ -904,8 +1251,11 @@ function controlPageHtml() {
             speechLog.prepend(line);
             speechLive.textContent = t;
             speechLive.style.color = 'var(--success)';
-            // Send to Owi as reminder text
-            fetch('/reminder',{method:'POST',headers:{'Content-Type':'text/plain'},body:t.slice(0,32)}).catch(()=>{});
+            // DENGAR -> PAHAM -> JAWAB: transcript final masuk ke chatbot, bukan reminder.
+            if (chatInput && sendChatBtn) {
+              chatInput.value = t.trim();
+              sendChatBtn.click();
+            }
           } else {
             interim += t;
           }
@@ -924,9 +1274,66 @@ function controlPageHtml() {
     document.getElementById('stopSpeech').onclick = () => {
       isListening = false;
       if (recognition) try { recognition.stop(); } catch(e) {}
-      speechStatus.textContent = 'IDLE'; speechStatus.style.color = '#999';
+      speechStatus.textContent = 'IDLE';
       speechLive.textContent = '...';
     };
+
+    // Chatbot UI Logic
+    const chatInput = document.getElementById('chatInput');
+    const sendChatBtn = document.getElementById('sendChatBtn');
+    const chatHistory = document.getElementById('chatHistory');
+
+    function appendChat(sender, msg, color, bg) {
+      const bubble = document.createElement('div');
+      bubble.style.padding = '0.5rem 0.8rem';
+      bubble.style.borderRadius = '8px';
+      bubble.style.maxWidth = '85%';
+      bubble.style.background = bg;
+      bubble.style.color = color;
+      bubble.style.alignSelf = sender === 'User' ? 'flex-end' : 'flex-start';
+      bubble.style.boxShadow = '1px 1px 0 #000';
+      const strong = document.createElement('strong');
+      strong.textContent = sender;
+      bubble.appendChild(strong);
+      bubble.appendChild(document.createElement('br'));
+      bubble.appendChild(document.createTextNode(msg));
+      chatHistory.appendChild(bubble);
+      chatHistory.scrollTop = chatHistory.scrollHeight;
+    }
+
+    sendChatBtn.onclick = () => {
+      const msg = chatInput.value.trim();
+      if (!msg) return;
+      chatInput.value = '';
+      sendChatBtn.disabled = true;
+      appendChat('Kamu', msg, '#fff', 'var(--accent)');
+      
+      fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: msg })
+      })
+      .then(r => r.json())
+      .then(res => {
+        sendChatBtn.disabled = false;
+        if (res.error) {
+          appendChat('Error', res.error, '#fff', 'var(--error)');
+        } else {
+          appendChat('Owi (' + (res.model || res.provider || 'AI') + ')', res.response, '#000', '#f1f1f1');
+          if (res.oledSent === false) appendChat('OLED', 'Belum terkirim ke OLED: ' + (res.oledError || 'serial error'), '#fff', 'var(--error)');
+          refreshAiLimit();
+        }
+      })
+      .catch(e => {
+        sendChatBtn.disabled = false;
+        appendChat('Error', 'Gagal memanggil API', '#fff', 'var(--error)');
+      });
+    };
+    
+    chatInput.addEventListener('keypress', function (e) {
+      if (e.key === 'Enter') sendChatBtn.onclick();
+    });
+
   </script>
 </body>
 </html>`;
@@ -954,12 +1361,55 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(latestTelemetry));
     return;
   }
+  if (req.method === "GET" && req.url === "/api/ai-limit") {
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(getAiLimitStatus()));
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/chat") {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", async () => {
+      try {
+        const data = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+        const userMsg = sanitizeOledText(data.message || "Halo");
+        const limitStatus = getAiLimitStatus();
+        if (limitStatus.remaining <= 0) {
+          res.writeHead(429, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: `Limit AI hari ini habis (${limitStatus.used}/${limitStatus.limit}).` }));
+          return;
+        }
+
+        const aiReply = await askOwi(userMsg);
+        let reply = sanitizeOledText(aiReply.text);
+        aiUsage.count += 1;
+        
+        let oledSent = true;
+        let oledError = "";
+        try {
+          await sendChatText(reply);
+        } catch (serialErr) {
+          oledSent = false;
+          oledError = serialErr.message;
+          logEvent(`chat oled err: ${oledError}`);
+          await closeSerial();
+        }
+        
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ response: reply, provider: aiReply.provider, model: aiReply.model, oledSent, oledError, ai: getAiLimitStatus() }));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
   if (req.method === "POST" && req.url === "/clear") {
     sendCommand("C").then(() => res.end("Balik ke wajah")).catch((err) => {res.writeHead(500);res.end(err.message);});
     return;
   }
   if (req.method === "POST" && req.url === "/play_audio") {
-    let vol = "0.50";
+    let vol = "0.30";
     let file = "lovestory.mp3";
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
@@ -980,6 +1430,29 @@ const server = http.createServer((req, res) => {
       }
       streamAudio(latestTelemetry.ip, vol, file);
       res.end(`Memutar ${file}`);
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/test_max") {
+    let vol = "0.35";
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+        if (data.volume) vol = data.volume;
+      } catch(e) {}
+
+      if (!latestTelemetry.ip) {
+        res.writeHead(400); res.end("IP Owi belum kebaca");
+        return;
+      }
+      if (isStreamingAudio) {
+        res.writeHead(400); res.end("Masih ada audio berjalan");
+        return;
+      }
+      streamTestTone(latestTelemetry.ip, vol);
+      res.end("Test MAX: nada 880Hz dikirim");
     });
     return;
   }
