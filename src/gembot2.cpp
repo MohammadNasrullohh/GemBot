@@ -458,10 +458,6 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
           currentChatText = "GemBot lagi mikir...";
           chatTextX = 240;
           isChatActive = true;
-          // Play a short SFX
-          setDfVolume(15);
-          waitDfCommandGap();
-          myDFPlayer.playMp3Folder(2);
         }
      } else if (text.startsWith("VOICE:ERROR")) {
         if (!voiceRecording) {
@@ -1229,8 +1225,8 @@ void updateReminders() {
 
 void waitDfCommandGap() {
   unsigned long now = millis();
-  if (lastDfCommandMs > 0 && now - lastDfCommandMs < 150UL) {
-    delay(150UL - (now - lastDfCommandMs));
+  if (lastDfCommandMs > 0 && now - lastDfCommandMs < 90UL) {
+    delay(90UL - (now - lastDfCommandMs));
   }
   lastDfCommandMs = millis();
 }
@@ -2928,7 +2924,7 @@ void setup() {
     waitDfCommandGap();
     myDFPlayer.outputDevice(DFPLAYER_DEVICE_SD);
     waitDfCommandGap();
-    myDFPlayer.EQ(DFPLAYER_EQ_POP);
+    myDFPlayer.EQ(DFPLAYER_EQ_NORMAL);
     applyDfVolume(true);
   }
 
