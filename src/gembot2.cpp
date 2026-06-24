@@ -2972,35 +2972,75 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   WiFi.setSleep(false);
   int attempts = 0;
+  // Morphing face boot animation — eyes start as tiny dots and grow
+  float bootEyeScale = 0.0f;    // 0.0 = tiny dots, 1.0 = full size
+  float bootMouthVis = 0.0f;    // mouth visibility
+  float bootPupilVis = 0.0f;    // pupil visibility
+  float bootBreathing = 0.0f;   // breathing amplitude
+  uint16_t bootFaceColor = spr.color565(0, 205, 255);
+  
   while (WiFi.status() != WL_CONNECTED && attempts < 300) {
       spr.fillSprite(TFT_BLACK);
+      float t = millis() / 1000.0f;
       
-      // Retro smooth connecting animation (Synthwave / Arcade style)
-      float t = millis() / 200.0;
+      // Smoothly grow eyes from dots (0.05 -> 0.55 during connect)
+      float targetScale = constrain(attempts / 180.0f, 0.05f, 0.55f);
+      bootEyeScale += (targetScale - bootEyeScale) * 0.08f;
       
-      // Draw 3 bouncing retro blocks
-      for (int i=0; i<3; i++) {
-         float delayT = t + (i * 1.5);
-         int blockY = 110 + sin(delayT) * 15;
-         int blockH = 20 + cos(delayT) * 10;
-         // Color gradient: Neon Pink to Neon Cyan
-         uint16_t color = spr.color565(255 - (i*50), 50 + (i*80), 255); 
-         spr.fillRoundRect(80 + (i*40), blockY - blockH/2, 24, blockH, 4, color);
+      // Gentle pulse while connecting
+      float pulse = 1.0f + sin(t * 4.0f) * 0.12f;
+      float scale = bootEyeScale * pulse;
+      
+      // Body bob starts subtle
+      float bob = sin(t * 2.0f) * (bootEyeScale * 4.0f);
+      
+      // Calculate face layout (same math as drawFaceAlive)
+      float baseScale = 2.38f * scale;
+      float verticalSpread = 1.18f;
+      int originX = (240 - (int)(128 * baseScale)) / 2;
+      int originY = (320 - (int)(64 * verticalSpread * baseScale)) / 2 + (int)bob;
+      
+      int nominalEyeW = max(4, (int)(26 * baseScale));
+      int nominalEyeH = max(4, (int)(37 * verticalSpread * baseScale));
+      int leftCX = originX + (int)(41 * baseScale);
+      int rightCX = originX + (int)(89 * baseScale);
+      int eyeCY = originY + (int)((13 + 18.5f) * verticalSpread * baseScale);
+      
+      if (nominalEyeW < 8) {
+        // Very early: just pulsing circles
+        int r = max(2, nominalEyeW / 2);
+        spr.fillCircle(leftCX, eyeCY, r, bootFaceColor);
+        spr.fillCircle(rightCX, eyeCY, r, bootFaceColor);
+      } else {
+        // Growing eyes using bitmap
+        int leftX = leftCX - nominalEyeW / 2;
+        int leftY = eyeCY - nominalEyeH / 2;
+        int rightX = rightCX - nominalEyeW / 2;
+        int rightY = eyeCY - nominalEyeH / 2;
+        drawBitmapScaled(leftX, leftY, image_Layer_9_bits, 26, 37,
+                         baseScale, verticalSpread * baseScale, bootFaceColor);
+        drawBitmapScaled(rightX, rightY, image_Layer_8_bits, 26, 37,
+                         baseScale, verticalSpread * baseScale, bootFaceColor);
       }
       
-      // Neon Cyan text
-      spr.setTextColor(spr.color565(0, 255, 255)); 
+      // Status text below face
+      spr.setTextSize(1);
       spr.setTextDatum(MC_DATUM);
-      spr.drawString("CONNECTING...", 120, 170, 2);
-      
-      // Blinking dots
+      spr.setTextColor(spr.color565(0, 180, 220));
       String dots = "";
-      for (int i=0; i <= ((attempts/10) % 3); i++) dots += ".";
-      spr.drawString(dots, 120, 190, 2);
-
-      spr.pushSprite(0, 0);
+      for (int i = 0; i <= ((attempts/8) % 3); i++) dots += ".";
+      spr.drawString("Menghubungkan" + dots, 120, 280, 2);
       
-      delay(30); // 30ms for smooth animation (~33 FPS)
+      // Subtle ring animation around face
+      int ringR = 40 + (int)(sin(t * 3.0f) * 8.0f);
+      uint8_t ringAlpha = (uint8_t)(40 + sin(t * 2.5f) * 30);
+      spr.drawCircle(120, eyeCY, ringR, spr.color565(0, ringAlpha, ringAlpha + 20));
+      
+      display.startWrite();
+      spr.pushSprite(0, 0);
+      display.endWrite();
+      
+      delay(30);
       if (attempts % 10 == 0) Serial.print(".");
       attempts++;
   }
@@ -3026,38 +3066,85 @@ void setup() {
   Serial.printf("Free heap after I2S: %d bytes\n", ESP.getFreeHeap());
   Serial.printf("Sprite pointer: %p\n", spr.getPointer());
   
-  // Retro "Gembot Siap" animation (Synthwave style)
-  for(int i=0; i<30; i++) {
+  // Morphing "wake up" animation — face grows to full size and smiles
+  unsigned long wakeStartMs = millis();
+  for(int i = 0; i < 45; i++) {
       spr.fillSprite(TFT_BLACK);
+      float progress = constrain(i / 44.0f, 0.0f, 1.0f);
+      // Ease-out cubic for smooth deceleration
+      float eased = 1.0f - (1.0f - progress) * (1.0f - progress) * (1.0f - progress);
+      float t = millis() / 1000.0f;
       
-      // Draw expanding synthwave sun
-      int radius = i * 3;
-      if (radius > 60) radius = 60;
+      // Eye scale: grow from connecting size (0.55) to full (1.0)
+      float scale = 0.55f + eased * 0.45f;
+      bootMouthVis += (eased - bootMouthVis) * 0.15f;
+      bootPupilVis += (eased - bootPupilVis) * 0.12f;
+      bootBreathing += (1.0f - bootBreathing) * 0.06f;
       
-      // Draw sun base (Neon Pink / Orange gradient simulation)
-      uint16_t sunColor = spr.color565(255, 100 + (i*3), 0);
-      spr.fillCircle(120, 100, radius, sunColor);
+      float breathing = 1.0f + sin(t * 1.5f) * 0.018f * bootBreathing;
+      float baseScale = 2.38f * scale * breathing;
+      float verticalSpread = 1.18f;
+      float bob = sin(t * 2.0f) * 2.4f * eased;
       
-      // Draw retro sun cutouts (horizontal lines)
-      if (radius > 20) {
-          for(int y = 100; y < 160; y += 8) {
-              spr.fillRect(120 - radius, y, radius*2, 4, TFT_BLACK);
-          }
+      int originX = (240 - (int)(128 * baseScale)) / 2;
+      int originY = (320 - (int)(64 * verticalSpread * baseScale)) / 2 + (int)bob;
+      
+      int nominalEyeW = max(10, (int)(26 * baseScale));
+      int nominalEyeH = max(14, (int)(37 * verticalSpread * baseScale));
+      int leftCX = originX + (int)(41 * baseScale);
+      int rightCX = originX + (int)(89 * baseScale);
+      int eyeCY = originY + (int)((13 + 18.5f) * verticalSpread * baseScale);
+      int leftX = leftCX - nominalEyeW / 2;
+      int leftY = eyeCY - nominalEyeH / 2;
+      int rightX = rightCX - nominalEyeW / 2;
+      int rightY = eyeCY - nominalEyeH / 2;
+      
+      // Draw eyes (full bitmap at this stage)
+      drawBitmapScaled(leftX, leftY, image_Layer_9_bits, 26, 37,
+                       baseScale, verticalSpread * baseScale, bootFaceColor);
+      drawBitmapScaled(rightX, rightY, image_Layer_8_bits, 26, 37,
+                       baseScale, verticalSpread * baseScale, bootFaceColor);
+      
+      // Pupils fade in
+      if (bootPupilVis > 0.15f) {
+        int pupilR = max(3, (int)(4.0f * baseScale * 0.9f * bootPupilVis));
+        spr.fillCircle(leftCX, eyeCY, pupilR, TFT_BLACK);
+        spr.fillCircle(rightCX, eyeCY, pupilR, TFT_BLACK);
+        // Highlight
+        if (pupilR >= 5 && bootPupilVis > 0.6f) {
+          spr.fillCircle(leftCX - pupilR/3, eyeCY - pupilR/3, max(1, pupilR/4), TFT_WHITE);
+          spr.fillCircle(rightCX - pupilR/3, eyeCY - pupilR/3, max(1, pupilR/4), TFT_WHITE);
+        }
       }
       
-      if (i > 15) {
-          spr.setTextColor(spr.color565(0, 255, 255)); // Neon Cyan
-          spr.setTextDatum(MC_DATUM);
-          // Bounce text up
-          int textY = 190 - ((i - 15) * 2);
-          if (textY < 170) textY = 170;
-          spr.drawString("GEMBOT READY!", 120, textY, 4); // Font 4
+      // Mouth morphs in — starts as a line, curves into a smile
+      if (bootMouthVis > 0.1f) {
+        int mouthCX = originX + (int)(65 * baseScale);
+        int mouthCY = originY + (int)(51 * verticalSpread * baseScale);
+        float mouthW = 20.0f + bootMouthVis * 34.0f;
+        float mouthCurve = bootMouthVis * 13.0f;
+        drawMorphMouth(mouthCX, mouthCY, mouthW, mouthCurve, 0.0f, 0.0f, bootFaceColor);
       }
       
+      // "GEMBOT READY!" text fades in at the end
+      if (progress > 0.5f) {
+        float textAlpha = constrain((progress - 0.5f) * 2.0f, 0.0f, 1.0f);
+        uint8_t g = (uint8_t)(255 * textAlpha);
+        uint8_t b = (uint8_t)(255 * textAlpha);
+        spr.setTextSize(1);
+        spr.setTextDatum(MC_DATUM);
+        spr.setTextColor(spr.color565(0, g, b));
+        int textY = 280 - (int)((progress - 0.5f) * 16.0f);
+        spr.drawString("GEMBOT READY!", 120, textY, 4);
+      }
+      
+      display.startWrite();
       spr.pushSprite(0, 0);
+      display.endWrite();
       delay(30);
   }
-  delay(500);
+  delay(400);
+
 }
 
 void dhtTask(void *pvParameters) {
