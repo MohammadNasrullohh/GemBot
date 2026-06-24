@@ -64,7 +64,7 @@ volatile uint8_t micSelectedSlot = 0;
 RingbufHandle_t audioRingBuf = NULL;
 const size_t RING_BUF_SIZE = 98304;
 const float AI_OUTPUT_GAIN = 0.60f;
-const int32_t AI_OUTPUT_SOFT_LIMIT = 30000;
+const int32_t AI_OUTPUT_SOFT_LIMIT = 300;
 const size_t TTS_PREBUFFER_BYTES = 24000;
 const unsigned long TTS_PREBUFFER_MAX_MS = 2000UL;
 
@@ -449,7 +449,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         aiSpeakingUntilMs = millis() + 1800UL;
      } else if (text == "VOICE:THINKING") {
         if (!voiceRecording) {
-          currentState = APP_FACE;
+          if (currentState != APP_DRAW && currentState != APP_PINGPONG && currentState != APP_MUSIK) currentState = APP_FACE;
           currentExpressionId = 14; // Focus face
           manualExpressionUntilMs = millis() + 5000UL;
           currentChatText = "GemBot lagi mikir...";
@@ -458,7 +458,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         }
      } else if (text.startsWith("VOICE:ERROR")) {
         if (!voiceRecording) {
-          currentState = APP_FACE;
+          if (currentState != APP_DRAW && currentState != APP_PINGPONG && currentState != APP_MUSIK) currentState = APP_FACE;
           currentChatText = "Suara belum jelas, coba ulangi";
           chatTextX = 240;
           isChatActive = true;
