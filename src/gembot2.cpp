@@ -63,7 +63,7 @@ volatile uint8_t micSelectedSlot = 0;
 
 RingbufHandle_t audioRingBuf = NULL;
 const size_t RING_BUF_SIZE = 98304;
-const float AI_OUTPUT_GAIN = 0.70f;
+const float AI_OUTPUT_GAIN = 0.60f;
 const int32_t AI_OUTPUT_SOFT_LIMIT = 30000;
 const size_t TTS_PREBUFFER_BYTES = 24000;
 const unsigned long TTS_PREBUFFER_MAX_MS = 2000UL;
@@ -116,7 +116,6 @@ bool ensureSpriteReady();
 void pushSpriteSafe();
 void recoverDisplayIfNeeded();
 void applyDfVolume(bool force = false);
-void waitDfCommandGap();
 unsigned long touchStartTime = 0;
 bool touchHandled = false;
 
@@ -177,10 +176,8 @@ bool dfPlayerReady = false;
 bool dfMusicPlaying = false;
 bool dfMusicPaused = false;
 int dfCurrentTrack = 0;
-int dfVolume = 15;
+int dfVolume = 20;
 int dfAppliedVolume = -1;
-unsigned long lastDfCommandMs = 0;
-const int DFPLAYER_MAX_CLEAN_VOLUME = 20;
 unsigned long dfTrackStartedMs = 0;
 unsigned long dfPausedAtMs = 0;
 const int dfTrackCount = 4;
@@ -1223,19 +1220,10 @@ void updateReminders() {
   }
 }
 
-void waitDfCommandGap() {
-  unsigned long now = millis();
-  if (lastDfCommandMs > 0 && now - lastDfCommandMs < 90UL) {
-    delay(90UL - (now - lastDfCommandMs));
-  }
-  lastDfCommandMs = millis();
-}
-
 void applyDfVolume(bool force) {
   if (!dfPlayerReady) return;
-  dfVolume = constrain(dfVolume, 0, DFPLAYER_MAX_CLEAN_VOLUME);
+  dfVolume = constrain(dfVolume, 0, 30);
   if (!force && dfAppliedVolume == dfVolume) return;
-  waitDfCommandGap();
   myDFPlayer.volume(dfVolume);
   dfAppliedVolume = dfVolume;
 }
@@ -1243,8 +1231,7 @@ void applyDfVolume(bool force) {
 void playDfTrack(int track) {
   dfCurrentTrack = normalizeDfTrack(track);
   if (dfPlayerReady) {
-    applyDfVolume(false);
-    waitDfCommandGap();
+    myDFPlayer.volume(dfVolume);
     myDFPlayer.playMp3Folder(dfCurrentTrack);
   }
   dfMusicPlaying = true;
@@ -1258,7 +1245,6 @@ void playDfTrack(int track) {
 void pauseDfMusic() {
   if (!dfMusicPlaying || dfMusicPaused) return;
   if (dfPlayerReady) {
-    waitDfCommandGap();
     myDFPlayer.pause();
   }
   dfMusicPaused = true;
@@ -1268,7 +1254,6 @@ void pauseDfMusic() {
 void resumeDfMusic() {
   if (!dfMusicPlaying || !dfMusicPaused) return;
   if (dfPlayerReady) {
-    waitDfCommandGap();
     myDFPlayer.start();
   }
   dfMusicPaused = false;
@@ -1280,8 +1265,8 @@ void resumeDfMusic() {
 }
 
 void stopDfMusic() {
+  if (!dfMusicPlaying) return;
   if (dfPlayerReady) {
-    waitDfCommandGap();
     myDFPlayer.stop();
   }
   dfMusicPlaying = false;
@@ -1300,7 +1285,6 @@ void updateDfMusicEnd() {
   if (elapsedMs < endMs) return;
 
   if (dfPlayerReady) {
-    waitDfCommandGap();
     myDFPlayer.stop();
   }
   dfMusicPlaying = false;
@@ -1312,8 +1296,8 @@ void updateDfMusicEnd() {
 }
 
 void setDfVolume(int volume) {
-  dfVolume = constrain(volume, 0, DFPLAYER_MAX_CLEAN_VOLUME);
-  applyDfVolume(false);
+  dfVolume = constrain(volume, 0, 30);
+  applyDfVolume(true);
 }
 
 void handleDfPlayerCommand(const String& text) {
@@ -2921,11 +2905,7 @@ void setup() {
   } else {
     Serial.println(F("DFPlayer Mini online."));
     dfPlayerReady = true;
-    waitDfCommandGap();
-    myDFPlayer.outputDevice(DFPLAYER_DEVICE_SD);
-    waitDfCommandGap();
-    myDFPlayer.EQ(DFPLAYER_EQ_NORMAL);
-    applyDfVolume(true);
+    myDFPlayer.volume(dfVolume);
   }
 
   xTaskCreatePinnedToCore(dhtTask, "DHT Task", 2048, NULL, 1, NULL, 1);
