@@ -174,7 +174,7 @@ int dfCurrentTrack = 0;
 int dfVolume = 18;
 int dfAppliedVolume = -1;
 unsigned long lastDfCommandMs = 0;
-const int DFPLAYER_MAX_CLEAN_VOLUME = 24;
+const int DFPLAYER_MAX_CLEAN_VOLUME = 20;
 unsigned long dfTrackStartedMs = 0;
 unsigned long dfPausedAtMs = 0;
 const int dfTrackCount = 4;
@@ -371,19 +371,19 @@ void pushSpriteSafe() {
     }
     return;
   }
+  display.startWrite();
   spr.pushSprite(0, 0);
+  display.endWrite();
   lastDisplayPushMs = millis();
 }
 
 void recoverDisplayIfNeeded() {
   unsigned long now = millis();
-  if (now - lastDisplayRecoverMs < 5000UL) return;
+  if (now - lastDisplayRecoverMs < 3000UL) return;
   if (spr.getPointer() != nullptr) return;
 
   lastDisplayRecoverMs = now;
-  Serial.println("[TFT] Reinitializing display surface");
-  display.begin();
-  display.setRotation(0);
+  Serial.println("[TFT] Recovering sprite (no full reinit)");
   display.fillScreen(TFT_BLACK);
   ensureSpriteReady();
   lastScreenDrawMs = 0;
@@ -451,8 +451,9 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
           chatTextX = 240;
           isChatActive = true;
           // Play a short SFX
-          setDfVolume(25);
-          df.play(2);
+          setDfVolume(18);
+          waitDfCommandGap();
+          myDFPlayer.playMp3Folder(2);
         }
      } else if (text.startsWith("VOICE:ERROR")) {
         if (!voiceRecording) {
@@ -1220,8 +1221,8 @@ void updateReminders() {
 
 void waitDfCommandGap() {
   unsigned long now = millis();
-  if (lastDfCommandMs > 0 && now - lastDfCommandMs < 90UL) {
-    delay(90UL - (now - lastDfCommandMs));
+  if (lastDfCommandMs > 0 && now - lastDfCommandMs < 150UL) {
+    delay(150UL - (now - lastDfCommandMs));
   }
   lastDfCommandMs = millis();
 }
@@ -2923,7 +2924,7 @@ void setup() {
     waitDfCommandGap();
     myDFPlayer.outputDevice(DFPLAYER_DEVICE_SD);
     waitDfCommandGap();
-    myDFPlayer.EQ(DFPLAYER_EQ_NORMAL);
+    myDFPlayer.EQ(DFPLAYER_EQ_POP);
     applyDfVolume(true);
   }
 
@@ -3154,6 +3155,7 @@ void loop() {
 
   
   webSocket.loop();
+  yield();
   if (voiceRecording) sendPendingMicAudio();
   readAudioStream();
   sendTelemetry();
