@@ -63,7 +63,7 @@ volatile uint8_t micSelectedSlot = 0;
 
 RingbufHandle_t audioRingBuf = NULL;
 const size_t RING_BUF_SIZE = 98304;
-const float AI_OUTPUT_GAIN = 1.25f;
+const float AI_OUTPUT_GAIN = 0.85f;
 const int32_t AI_OUTPUT_SOFT_LIMIT = 30000;
 const size_t TTS_PREBUFFER_BYTES = 24000;
 const unsigned long TTS_PREBUFFER_MAX_MS = 2000UL;
@@ -163,7 +163,13 @@ bool isChatActive = false;
 bool isWsConnected = false;
 unsigned long lastTelemetryMs = 0;
 unsigned long lastScreenDrawMs = 0;
-const uint16_t UI_FRAME_MS = 45;
+unsigned long lastFrameMs = 0;
+const int UI_FRAME_MS = 45;
+
+// Variables moved up for global visibility
+unsigned long lastInteractionMs = 0;
+float currentSleepAmount = 0;
+float currentListenPulse = 0;
 unsigned long lastDisplayPushMs = 0;
 unsigned long lastDisplayRecoverMs = 0;
 
@@ -171,10 +177,10 @@ bool dfPlayerReady = false;
 bool dfMusicPlaying = false;
 bool dfMusicPaused = false;
 int dfCurrentTrack = 0;
-int dfVolume = 18;
+int dfVolume = 12;
 int dfAppliedVolume = -1;
 unsigned long lastDfCommandMs = 0;
-const int DFPLAYER_MAX_CLEAN_VOLUME = 20;
+const int DFPLAYER_MAX_CLEAN_VOLUME = 15;
 unsigned long dfTrackStartedMs = 0;
 unsigned long dfPausedAtMs = 0;
 const int dfTrackCount = 4;
@@ -371,19 +377,19 @@ void pushSpriteSafe() {
     }
     return;
   }
-  display.startWrite();
   spr.pushSprite(0, 0);
-  display.endWrite();
   lastDisplayPushMs = millis();
 }
 
 void recoverDisplayIfNeeded() {
   unsigned long now = millis();
-  if (now - lastDisplayRecoverMs < 3000UL) return;
+  if (now - lastDisplayRecoverMs < 4000UL) return;
   if (spr.getPointer() != nullptr) return;
 
   lastDisplayRecoverMs = now;
-  Serial.println("[TFT] Recovering sprite (no full reinit)");
+  Serial.println("[TFT] Reinitializing display surface");
+  display.begin();
+  display.setRotation(0);
   display.fillScreen(TFT_BLACK);
   ensureSpriteReady();
   lastScreenDrawMs = 0;
@@ -407,6 +413,9 @@ void exitDrawMode() {
   display.fillScreen(TFT_BLACK);
   lastScreenDrawMs = 0;
 }
+
+// Forward declarations
+void setDfVolume(int volume);
 
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
   lastInteractionMs = millis();
@@ -444,8 +453,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
      } else if (text == "VOICE:THINKING") {
         if (!voiceRecording) {
           currentState = APP_FACE;
-          currentFace = 14; // Focus face
-          targetFace = 14;
+          currentExpressionId = 14; // Focus face
           manualExpressionUntilMs = millis() + 5000UL;
           currentChatText = "GemBot lagi mikir...";
           chatTextX = 240;
@@ -1577,10 +1585,6 @@ float currentMouthOpen = 0;
 float currentMouthTalk = 0;
 unsigned long lastIdleMs = 0;
 bool isSleeping = false;
-unsigned long lastInteractionMs = 0;
-float currentSleepAmount = 0;
-float currentListenPulse = 0;
-
 static const unsigned char PROGMEM image_Layer_7_bits[] = {0xc0,0x03,0xe0,0x07,0xf8,0x1f,0x7f,0xfe,0x3f,0xfc,0x0f,0xf0};
 
 static const unsigned char PROGMEM image_Layer_8_bits[] = {0x3f,0xff,0xf8,0x00,0x7f,0xff,0xfe,0x00,0xff,0xff,0xff,0x00,0xff,0xff,0xff,0x80,0xff,0xff,0xff,0x80,0xff,0xff,0xff,0x80,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0xc0,0xff,0xff,0xff,0x80,0xff,0xff,0xff,0x80,0xff,0xff,0xff,0x80,0xff,0xff,0xff,0x80,0xff,0xff,0xff,0x00,0x7f,0xff,0xff,0x00,0x7f,0xff,0xff,0x00,0x7f,0xff,0xfe,0x00,0x7f,0xff,0xfe,0x00,0x3f,0xff,0xfc,0x00,0x1f,0xff,0xf8,0x00,0x0f,0xff,0xe0,0x00,0x07,0xff,0x00,0x00};
@@ -3035,10 +3039,7 @@ void setup() {
       int ringR = 40 + (int)(sin(t * 3.0f) * 8.0f);
       uint8_t ringAlpha = (uint8_t)(40 + sin(t * 2.5f) * 30);
       spr.drawCircle(120, eyeCY, ringR, spr.color565(0, ringAlpha, ringAlpha + 20));
-      
-      display.startWrite();
       spr.pushSprite(0, 0);
-      display.endWrite();
       
       delay(30);
       if (attempts % 10 == 0) Serial.print(".");
@@ -3137,10 +3138,7 @@ void setup() {
         int textY = 280 - (int)((progress - 0.5f) * 16.0f);
         spr.drawString("GEMBOT READY!", 120, textY, 4);
       }
-      
-      display.startWrite();
       spr.pushSprite(0, 0);
-      display.endWrite();
       delay(30);
   }
   delay(400);
