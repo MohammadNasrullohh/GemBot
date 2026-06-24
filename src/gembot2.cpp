@@ -2898,7 +2898,7 @@ void setup() {
   Serial.begin(115200);
 
   mySoftwareSerial.begin(9600, SERIAL_8N1, DFPLAYER_RX, DFPLAYER_TX);
-  if (!myDFPlayer.begin(mySoftwareSerial, true, false)) {
+  if (!myDFPlayer.begin(mySoftwareSerial, false, false)) {
     Serial.println(F("Unable to begin DFPlayer:"));
     Serial.println(F("1.Please recheck the connection!"));
     Serial.println(F("2.Please insert the SD card!"));
@@ -2950,6 +2950,9 @@ void setup() {
   }
 
   // Setup WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   WiFi.setSleep(false);
   int attempts = 0;
@@ -2960,7 +2963,7 @@ void setup() {
   float bootBreathing = 0.0f;   // breathing amplitude
   uint16_t bootFaceColor = spr.color565(0, 205, 255);
   
-  while (WiFi.status() != WL_CONNECTED && attempts < 300) {
+  while (WiFi.status() != WL_CONNECTED && attempts < 600) {
       spr.fillSprite(TFT_BLACK);
       float t = millis() / 1000.0f;
       
