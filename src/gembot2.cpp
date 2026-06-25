@@ -1728,6 +1728,39 @@ void drawFace() {
           exprLookX = sin(now * 0.015f) * 12.0f;
           exprLookY = cos(now * 0.015f) * 12.0f;
           break;
+      case 32: // Curiga / Suspicious
+          targetEyeScaleY = 0.25f;
+          targetMouthScaleX = 0.4f;
+          targetMouthOffsetY = -2.0f;
+          targetPupilScale = 0.6f;
+          exprLookX = 14.0f; // Melirik tajam ke samping
+          break;
+      case 33: // Keren / Cool / Smirk
+          targetEyeScaleY = 0.15f;
+          targetEyeOffsetY = 3.0f;
+          targetMouthScaleX = 1.2f;
+          targetMouthScaleY = 0.4f;
+          targetMouthOffsetY = -5.0f;
+          exprLookX = -5.0f;
+          break;
+      case 34: // Thinking / Loading
+          targetEyeScaleX = 0.8f;
+          targetEyeScaleY = 0.8f;
+          targetMouthScaleX = 0.5f;
+          targetMouthScaleY = 0.5f;
+          targetPupilScale = 0.4f;
+          exprLookX = sin(now * 0.008f) * 14.0f;
+          exprLookY = cos(now * 0.008f) * 14.0f;
+          break;
+      case 35: // Berbinar / Begging
+          targetEyeScaleX = 1.4f;
+          targetEyeScaleY = 1.4f;
+          targetPupilScale = 1.4f; // Pupil sangat besar
+          targetMouthScaleX = 0.6f;
+          targetMouthScaleY = 0.8f;
+          targetMouthOffsetY = 4.0f;
+          exprBobY = sin(now * 0.004f) * 3.0f;
+          break;
       case 13: case 20: // Bashful / Giggle
           targetEyeScaleY = 0.3f;
           targetMouthScaleX = 1.2f;
