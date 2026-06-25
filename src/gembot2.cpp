@@ -2313,23 +2313,28 @@ void drawFaceAlive() {
       exprBobY = sin(now * 0.013f) * 7.0f;
       break;
     case 32: // Curiga / Suspicious
-      tEyeLY = tEyeRY = 0.25f;
-      tPupilScale = 0.6f; tBrowAngle = 5.0f; tBrowLift = 2.0f; tBrowVisibility = 0.8f;
-      tMouthWidth = 24.0f; tMouthCurve = 0.0f; tMouthSlant = 4.0f;
-      exprLookX = 14.0f;
+      tEyeLX = tEyeRX = 0.95f; tEyeLY = tEyeRY = 0.45f;
+      tPupilScale = 0.45f; tBrowAngle = 10.0f; tBrowLift = -3.0f; tBrowVisibility = 0.95f;
+      tLidL = tLidR = 0.25f; // Kelopak mata turun membuat sipit
+      tMouthWidth = 18.0f; tMouthCurve = 0.0f; tMouthSlant = 6.0f;
+      exprLookX = 15.0f; // Melirik tajam ke kanan
       break;
-    case 33: // Keren / Cool
-      tEyeLY = tEyeRY = 0.15f; tEyeOffsetY = 3.0f;
-      tPupilScale = 0.8f;
-      tMouthWidth = 40.0f; tMouthCurve = 4.0f; tMouthSlant = 6.0f;
-      exprLookX = -4.0f;
+    case 33: // Keren / Cool (Kacamata Hitam)
+      tEyeLX = tEyeRX = 1.4f; tEyeLY = tEyeRY = 0.35f; 
+      tPupilScale = 4.0f; // Pupil raksasa membuat seluruh mata jadi hitam pekat (kacamata)
+      tBrowLift = 2.0f; tBrowVisibility = 0.0f;
+      tMouthWidth = 35.0f; tMouthCurve = 4.0f; tMouthSlant = -6.0f; // Smirk
+      exprLookX = 0.0f;
       break;
-    case 34: // Loading / Mikir
-      tEyeLX = tEyeRX = 0.8f; tEyeLY = tEyeRY = 0.8f;
-      tPupilScale = 0.45f; spiralPupils = true;
-      tMouthWidth = 20.0f; tMouthCurve = -3.0f; tMouthOpen = 6.0f;
-      exprLookX = sin(now * 0.008f) * 14.0f;
-      exprLookY = cos(now * 0.008f) * 14.0f;
+    case 34: // Loading / Mikir (Mata berdenyut gantian)
+      tEyeLX = 0.8f + sin(now * 0.006f) * 0.4f;
+      tEyeLY = 0.8f + cos(now * 0.006f) * 0.4f;
+      tEyeRX = 0.8f + cos(now * 0.006f) * 0.4f;
+      tEyeRY = 0.8f + sin(now * 0.006f) * 0.4f;
+      tPupilScale = 0.6f; 
+      tMouthWidth = 12.0f; tMouthCurve = 0.0f; tMouthOpen = 12.0f; // Mulut bulat O kecil
+      exprLookX = 0.0f; exprLookY = 0.0f;
+      exprBobY = sin(now * 0.008f) * 3.0f; // Melayang pelan
       break;
     case 35: // Berbinar / Begging
       tEyeLX = tEyeRX = 1.35f; tEyeLY = tEyeRY = 1.35f;
