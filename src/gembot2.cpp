@@ -2343,6 +2343,44 @@ void drawFaceAlive() {
       tMouthWidth = 34.0f; tMouthCurve = 8.0f; tMouthOpen = 8.0f;
       exprBobY = sin(now * 0.005f) * 3.0f;
       break;
+    case 36: // Kecewa / Disappointed / Sigh
+      tEyeLX = tEyeRX = 1.0f; tEyeLY = tEyeRY = 0.5f;
+      tBrowAngle = 0.0f; tBrowLift = 4.0f; tBrowVisibility = 0.8f;
+      tLidL = tLidR = 0.15f;
+      tMouthWidth = 28.0f; tMouthCurve = 0.0f;
+      exprLookY = 12.0f; // Menunduk tajam
+      exprBobY = 3.0f; // Kepala tertunduk turun
+      break;
+    case 37: // Rage / Ngamuk
+      tEyeLX = tEyeRX = 1.1f; tEyeLY = tEyeRY = 0.9f;
+      tPupilScale = 0.3f; // Mata membelalak, pupil mengecil
+      tBrowAngle = 18.0f; tBrowLift = -5.0f; tBrowVisibility = 1.0f;
+      tMouthWidth = 40.0f; tMouthCurve = -6.0f; tMouthOpen = 25.0f; // Teriak
+      exprBobY = sin(now * 0.05f) * 5.0f; // Gemetar hebat (marah)
+      exprLeanX = cos(now * 0.04f) * 3.0f;
+      break;
+    case 38: // Bosan / Meh
+      tEyeLX = tEyeRX = 0.95f; tEyeLY = tEyeRY = 0.5f;
+      tLidL = tLidR = 0.35f; // Kelopak mata sangat berat/turun
+      tBrowAngle = 2.0f; tBrowLift = 1.0f; tBrowVisibility = 0.6f;
+      tMouthWidth = 32.0f; tMouthCurve = 0.0f; tMouthSlant = 4.0f; // Mulut miring datar
+      exprLookX = -8.0f; exprLookY = -2.0f; // Buang muka
+      break;
+    case 39: // Malu / Shy
+      tEyeLX = tEyeRX = 1.05f; tEyeLY = tEyeRY = 0.7f;
+      tPupilScale = 0.9f;
+      tBrowAngle = -8.0f; tBrowLift = 1.0f; tBrowVisibility = 0.85f; // Alis sedih/malu
+      tMouthWidth = 18.0f; tMouthCurve = 4.0f;
+      exprLookX = 10.0f; exprLookY = 10.0f; // Menunduk dan melirik ke bawah samping
+      exprBobY = sin(now * 0.003f) * 2.0f;
+      break;
+    case 40: // Bingung / Confused
+      tEyeLX = 0.9f; tEyeRX = 0.6f; tEyeLY = 0.8f; tEyeRY = 0.3f; // Mata besar sebelah
+      tPupilScale = 0.7f;
+      tBrowAngle = 12.0f; tBrowLift = 2.0f; tBrowVisibility = 0.9f; // Alis miring tajam
+      tMouthWidth = 15.0f; tMouthCurve = -3.0f; tMouthSlant = 5.0f; // Mulut kecil miring
+      exprLookX = 6.0f; exprLookY = -4.0f;
+      break;
     default:
       break;
   }
