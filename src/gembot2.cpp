@@ -2344,12 +2344,12 @@ void drawFaceAlive() {
       exprBobY = sin(now * 0.005f) * 3.0f;
       break;
     case 36: // Kecewa / Disappointed / Sigh
-      tEyeLX = tEyeRX = 1.0f; tEyeLY = tEyeRY = 0.5f;
-      tBrowAngle = 0.0f; tBrowLift = 4.0f; tBrowVisibility = 0.8f;
-      tLidL = tLidR = 0.15f;
-      tMouthWidth = 28.0f; tMouthCurve = 0.0f;
-      exprLookY = 12.0f; // Menunduk tajam
-      exprBobY = 3.0f; // Kepala tertunduk turun
+      tEyeLX = tEyeRX = 0.95f; tEyeLY = tEyeRY = 0.35f;
+      tPupilScale = 0.8f;
+      tBrowAngle = -6.0f; tBrowLift = 2.0f; tBrowVisibility = 0.9f; // Alis turun sedih
+      tMouthWidth = 34.0f; tMouthCurve = -7.0f; // Bibir melengkung ke bawah
+      exprLookX = 0.0f; exprLookY = 8.0f; // Menatap ke bawah
+      exprBobY = 3.0f; // Kepala sedikit menunduk
       break;
     case 37: // Rage / Ngamuk
       tEyeLX = tEyeRX = 1.1f; tEyeLY = tEyeRY = 0.9f;
@@ -2360,11 +2360,12 @@ void drawFaceAlive() {
       exprLeanX = cos(now * 0.04f) * 3.0f;
       break;
     case 38: // Bosan / Meh
-      tEyeLX = tEyeRX = 0.95f; tEyeLY = tEyeRY = 0.5f;
-      tLidL = tLidR = 0.35f; // Kelopak mata sangat berat/turun
-      tBrowAngle = 2.0f; tBrowLift = 1.0f; tBrowVisibility = 0.6f;
-      tMouthWidth = 32.0f; tMouthCurve = 0.0f; tMouthSlant = 4.0f; // Mulut miring datar
-      exprLookX = -8.0f; exprLookY = -2.0f; // Buang muka
+      tEyeLX = tEyeRX = 1.0f; tEyeLY = tEyeRY = 0.85f;
+      tPupilScale = 0.85f;
+      tLidL = tLidR = 0.45f; // Kelopak mata sangat turun/setengah tertutup (heavy eyes)
+      tBrowAngle = 0.0f; tBrowLift = 0.0f; tBrowVisibility = 0.7f; // Alis datar biasa
+      tMouthWidth = 40.0f; tMouthCurve = 0.0f; tMouthSlant = 2.0f; // Mulut garis lurus datar
+      exprLookX = -4.0f; exprLookY = 4.0f; // Pandangan malas
       break;
     case 39: // Malu / Shy
       tEyeLX = tEyeRX = 1.05f; tEyeLY = tEyeRY = 0.7f;
