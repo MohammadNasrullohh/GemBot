@@ -91,6 +91,7 @@ void dhtTask(void *pvParameters);
 
 // Touch Sensor Pin
 #define TOUCH_PIN 7
+#define BATTERY_PIN 3
 bool lastTouchState = false;
 
 extern unsigned long nodUntilMs;
@@ -180,6 +181,8 @@ int dfVolume = 20;
 int dfAppliedVolume = -1;
 unsigned long dfTrackStartedMs = 0;
 unsigned long dfPausedAtMs = 0;
+unsigned long dfUnmuteTimeMs = 0;
+unsigned long dfPlayerLastCmdMs = 0; // Track last DFPlayer command for EMI lockout on touch
 const int dfTrackCount = 4;
 const char* dfTrackTitles[dfTrackCount + 1] = {
   "", "Love Story", "MBG", "YELLOW", "REDRED"
@@ -340,6 +343,7 @@ bool isAiOutputActive() {
   return aiSpeaking || audioPrebuffering || now < aiSpeakingUntilMs || recentlyPlayed;
 }
 
+
 bool isVoiceOrAudioBusy() {
   return voiceRecording || currentState == APP_LISTENING || isAiOutputActive();
 }
@@ -404,7 +408,9 @@ void enterDrawMode(uint16_t bg) {
 
 void exitDrawMode() {
   isDrawMode = false;
-  currentState = APP_FACE;
+  if (currentState == APP_DRAW) {
+    currentState = APP_FACE;
+  }
   currentExpressionId = -1;
   manualExpressionUntilMs = 0;
   display.fillScreen(TFT_BLACK);
@@ -702,8 +708,13 @@ void micTask(void *pvParameters) {
     micPeakLevel = max(peakLevel, micPeakLevel * 0.86f);
 
     for (int frame = 0; frame < frameCount; frame++) {
-      // Convert signed 24-bit audio to 16-bit PCM with extra gain for STT.
-      int32_t sample16 = filtered[0][frame] >> 4;
+      // Convert signed 24-bit audio to 16-bit PCM (shift by 8).
+      int32_t true16 = filtered[0][frame] >> 8;
+      // Apply 12x digital gain for better STT recognition
+      int32_t sample16 = true16 * 12;
+      // Noise gate: if signal is too weak (background hiss), send silence
+      // This prevents EMI/ambient noise from confusing the STT engine
+      if (abs(sample16) < 180) sample16 = 0;
       pcm[frame] = (int16_t)constrain(sample16, -32767, 32767);
     }
 
@@ -1222,7 +1233,7 @@ void updateReminders() {
 
 void applyDfVolume(bool force) {
   if (!dfPlayerReady) return;
-  dfVolume = constrain(dfVolume, 0, 30);
+  dfVolume = constrain(dfVolume, 0, 12); // STRICT cap to 12 to stop power drain and blinking
   if (!force && dfAppliedVolume == dfVolume) return;
   myDFPlayer.volume(dfVolume);
   dfAppliedVolume = dfVolume;
@@ -1232,8 +1243,15 @@ void applyDfVolume(bool force) {
 void playDfTrack(int track) {
   dfCurrentTrack = normalizeDfTrack(track);
   if (dfPlayerReady) {
-    applyDfVolume(false);
+    if (dfMusicPlaying) {
+      myDFPlayer.stop(); // Stop current track first to prevent glitch
+      delay(100);
+    }
+    dfVolume = constrain(dfVolume, 0, 20); // Cap to 20 (safe with 5V DFPlayer power from MT3608)
+    myDFPlayer.volume(dfVolume);
+    delay(50); // MUST delay so HardwareSerial doesn't overwhelm the clone
     myDFPlayer.playMp3Folder(dfCurrentTrack);
+    dfPlayerLastCmdMs = millis(); // Record command time for touch EMI lockout
   }
   dfMusicPlaying = true;
   dfMusicPaused = false;
@@ -1246,7 +1264,9 @@ void playDfTrack(int track) {
 void pauseDfMusic() {
   if (!dfMusicPlaying || dfMusicPaused) return;
   if (dfPlayerReady) {
+    delay(20);
     myDFPlayer.pause();
+    dfPlayerLastCmdMs = millis();
   }
   dfMusicPaused = true;
   dfPausedAtMs = millis();
@@ -1255,7 +1275,9 @@ void pauseDfMusic() {
 void resumeDfMusic() {
   if (!dfMusicPlaying || !dfMusicPaused) return;
   if (dfPlayerReady) {
+    delay(20);
     myDFPlayer.start();
+    dfPlayerLastCmdMs = millis();
   }
   dfMusicPaused = false;
   if (dfPausedAtMs > dfTrackStartedMs) {
@@ -1268,7 +1290,12 @@ void resumeDfMusic() {
 void stopDfMusic() {
   if (!dfMusicPlaying) return;
   if (dfPlayerReady) {
+    delay(50);
     myDFPlayer.stop();
+    delay(100); // Give clone time to stop decoding
+    myDFPlayer.volume(0); // Mute amplifier to stop idle power drain and hiss
+    dfAppliedVolume = 0;
+    dfPlayerLastCmdMs = millis();
   }
   dfMusicPlaying = false;
   dfMusicPaused = false;
@@ -1287,6 +1314,9 @@ void updateDfMusicEnd() {
 
   if (dfPlayerReady) {
     myDFPlayer.stop();
+    delay(50);
+    myDFPlayer.volume(0);
+    dfAppliedVolume = 0;
   }
   dfMusicPlaying = false;
   dfMusicPaused = false;
@@ -1348,6 +1378,13 @@ void startVoiceRecording() {
   }
   clearMicStream();
   lastMicSendMs = 0;
+  // Mute DFPlayer before recording to prevent EMI contamination of mic signal
+  if (dfPlayerReady && dfMusicPlaying && !dfMusicPaused) {
+    myDFPlayer.pause();
+    dfMusicPaused = true;
+    dfPausedAtMs = millis();
+    dfPlayerLastCmdMs = millis();
+  }
   voiceStartedMs = millis();
   voiceLastSpeechMs = voiceStartedMs;
   voiceHeardSpeech = false;
@@ -1481,6 +1518,7 @@ void handleTouch() {
   static bool touchArmed = false;
   static unsigned long rawChangedMs = 0;
   const unsigned long TOUCH_DEBOUNCE_MS = 75;
+  const unsigned long MUSIC_DEBOUNCE_MS = 200; // Longer debounce for music to filter DFPlayer EMI noise
   const unsigned long TAP_MIN_MS = 45;
   const unsigned long HOLD_MS = 520;
   const unsigned long MUSIC_STOP_HOLD_MS = 1800;
@@ -1493,11 +1531,23 @@ void handleTouch() {
     rawTouch = sensedTouch;
     rawChangedMs = now;
   }
-  if (now - rawChangedMs >= TOUCH_DEBOUNCE_MS) stableTouch = rawTouch;
+  // Use longer debounce when music is playing to prevent DFPlayer EMI false triggers
+  unsigned long activeDebounce = (currentState == APP_MUSIK && dfMusicPlaying) ? MUSIC_DEBOUNCE_MS : TOUCH_DEBOUNCE_MS;
+  if (now - rawChangedMs >= activeDebounce) stableTouch = rawTouch;
 
   if (!touchArmed) {
     if (!stableTouch) touchArmed = true;
     else return;
+  }
+
+  // --- MUSIC STATE TOUCH HANDLER ---
+  // Guard: ignore touch for 600ms after any DFPlayer command (EMI from amplifier can cause false triggers)
+  const unsigned long DF_EMI_LOCKOUT_MS = 600;
+  if (currentState == APP_MUSIK && dfMusicPlaying && (millis() - dfPlayerLastCmdMs < DF_EMI_LOCKOUT_MS)) {
+    // Reset touch state during lockout so stale touches don't accumulate
+    touchStartTime = 0;
+    touchHandled = false;
+    return;
   }
 
   if (currentState == APP_MUSIK && dfMusicPlaying) {
@@ -2906,7 +2956,12 @@ void setup() {
   } else {
     Serial.println(F("DFPlayer Mini online."));
     dfPlayerReady = true;
-    myDFPlayer.volume(dfVolume);
+    delay(200); // Allow DFPlayer to finish booting
+    myDFPlayer.EQ(DFPLAYER_EQ_NORMAL); // Reset EQ to prevent amplifier noise modes
+    delay(50);
+    myDFPlayer.volume(0); // Mute initially to prevent idle hiss
+    dfAppliedVolume = 0;
+    dfPlayerLastCmdMs = millis();
   }
 
   xTaskCreatePinnedToCore(dhtTask, "DHT Task", 2048, NULL, 1, NULL, 1);
@@ -3148,6 +3203,15 @@ void sendTelemetry() {
   doc["type"] = "telemetry";
   doc["state"] = (int)currentState;
   doc["expr"] = String(displayedExpressionId);
+  
+  int rawBat = analogRead(BATTERY_PIN);
+  // Voltage divider (1K + 1K) halves the 4.2V max battery to 2.1V.
+  // ESP32 ADC (11dB attenuation) maxes around 3.1-3.3V (raw 4095).
+  // 4.2V batt -> 2.1V pin -> ~2600 raw
+  // 3.2V batt (empty) -> 1.6V pin -> ~1980 raw
+  int batPercent = map(rawBat, 1900, 2600, 0, 100);
+  doc["battery"] = constrain(batPercent, 0, 100);
+
   doc["temp"] = currentSuhu;
   doc["hum"] = currentLembap;
   doc["mpu"] = mpuReady ? 1 : 0;
@@ -3203,6 +3267,7 @@ void sendTelemetry() {
 }
 
 void loop() {
+  unsigned long now = millis();
 
   handleTouch();
   recoverDisplayIfNeeded();
@@ -3210,7 +3275,7 @@ void loop() {
   updateDfMusicEnd();
   updateAiSpeakingState();
   updateReminders();
-  unsigned long now = millis();
+  now = millis();
   if (currentState == APP_PINGPONG) {
     drawScreen();
   } else if (now - lastScreenDrawMs >= UI_FRAME_MS) {
@@ -3224,6 +3289,10 @@ void loop() {
   if (voiceRecording) sendPendingMicAudio();
   readAudioStream();
   sendTelemetry();
+  
+  if (currentState == APP_MUSIK || currentState == APP_DRAW || currentState == APP_PINGPONG || isDrawMode || aiSpeaking || voiceRecording) {
+    lastInteractionMs = now;
+  }
   
   if (now - lastInteractionMs > 300000) {
     if (!isSleeping) {
