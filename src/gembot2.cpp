@@ -427,6 +427,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     Serial.printf("[WS] Connected to url: %s\n", payload);
     webSocket.sendTXT("{\"type\":\"auth\",\"role\":\"owibot\"}");
   } else if (type == WStype_TEXT) {
+    lastInteractionMs = millis();
     String text = (char*)payload;
     if (text.startsWith("AUDIO:")) {
        voiceRecording = false;
@@ -517,7 +518,6 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
          chatTextX = 240;
          isChatActive = true;
     } else if (text.startsWith("CMD:M")) {
-       lastInteractionMs = millis();
        isDrawMode = false;
        String idStr = text.substring(5);
        currentExpressionId = idStr.toInt();
@@ -2386,6 +2386,10 @@ void drawFaceAlive() {
       break;
   }
 
+  // Universal lively idle animation for all emotions
+  exprBobY += sin(now * 0.0025f) * 1.5f;
+  exprLeanX += cos(now * 0.0015f) * 1.5f;
+  
   if (now >= nextSaccadeMs) {
     saccadeTargetX = (random(100) / 99.0f - 0.5f) * 10.0f;
     saccadeTargetY = (random(100) / 99.0f - 0.5f) * 6.0f;
@@ -2395,7 +2399,8 @@ void drawFaceAlive() {
   saccadeY = morphValue(saccadeY, saccadeTargetY, 0.22f);
 
   if (nextBlinkMs == 0) nextBlinkMs = now + random(2200, 5200);
-  if (blinkStartedMs == 0 && now >= nextBlinkMs && tEyeLY > 0.5f && tEyeRY > 0.5f) {
+  // Allow blinking as long as eyes aren't entirely squited flat
+  if (blinkStartedMs == 0 && now >= nextBlinkMs && tEyeLY > 0.15f && tEyeRY > 0.15f) {
     blinkStartedMs = now;
     nextBlinkMs = now + random(2600, 5600);
   }
