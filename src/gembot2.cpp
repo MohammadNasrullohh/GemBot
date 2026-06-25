@@ -517,6 +517,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
          chatTextX = 240;
          isChatActive = true;
     } else if (text.startsWith("CMD:M")) {
+       lastInteractionMs = millis();
        isDrawMode = false;
        String idStr = text.substring(5);
        currentExpressionId = idStr.toInt();
@@ -2311,22 +2312,31 @@ void drawFaceAlive() {
       tMouthWidth = 54.0f; tMouthCurve = 12.0f; tMouthOpen = 18.0f;
       exprBobY = sin(now * 0.013f) * 7.0f;
       break;
-    case 32: // Menyapa ramah (Greeting)
-      tEyeLY = tEyeRY = 0.55f;
-      tPupilScale = 0.85f; tBrowLift = 4.0f; tBrowVisibility = 0.8f;
-      tMouthWidth = 46.0f; tMouthCurve = 9.0f;
+    case 32: // Curiga / Suspicious
+      tEyeLY = tEyeRY = 0.25f;
+      tPupilScale = 0.6f; tBrowAngle = 5.0f; tBrowLift = 2.0f; tBrowVisibility = 0.8f;
+      tMouthWidth = 24.0f; tMouthCurve = 0.0f; tMouthSlant = 4.0f;
+      exprLookX = 14.0f;
+      break;
+    case 33: // Keren / Cool
+      tEyeLY = tEyeRY = 0.15f; tEyeOffsetY = 3.0f;
+      tPupilScale = 0.8f;
+      tMouthWidth = 40.0f; tMouthCurve = 4.0f; tMouthSlant = 6.0f;
+      exprLookX = -4.0f;
+      break;
+    case 34: // Loading / Mikir
+      tEyeLX = tEyeRX = 0.8f; tEyeLY = tEyeRY = 0.8f;
+      tPupilScale = 0.45f; spiralPupils = true;
+      tMouthWidth = 20.0f; tMouthCurve = -3.0f; tMouthOpen = 6.0f;
+      exprLookX = sin(now * 0.008f) * 14.0f;
+      exprLookY = cos(now * 0.008f) * 14.0f;
+      break;
+    case 35: // Berbinar / Begging
+      tEyeLX = tEyeRX = 1.35f; tEyeLY = tEyeRY = 1.35f;
+      tPupilScale = 1.4f; pupilHighlights = true;
+      tBrowAngle = -10.0f; tBrowLift = -3.0f; tBrowVisibility = 0.9f;
+      tMouthWidth = 34.0f; tMouthCurve = 8.0f; tMouthOpen = 8.0f;
       exprBobY = sin(now * 0.005f) * 3.0f;
-      break;
-    case 33: // Santai (Relaxed)
-      tEyeLX = tEyeRX = 0.96f; tEyeLY = tEyeRY = 0.70f;
-      tMouthWidth = 38.0f; tMouthCurve = 5.0f;
-      exprBobY = sin(now * 0.003f) * 2.0f;
-      break;
-    case 34: // Menatap lembut (Soft gaze)
-      tEyeLX = tEyeRX = 1.05f; tEyeLY = tEyeRY = 0.80f;
-      tPupilScale = 0.90f; tBrowLift = 2.0f; tBrowVisibility = 0.6f;
-      tMouthWidth = 34.0f; tMouthCurve = 3.0f;
-      exprBobY = sin(now * 0.004f) * 1.5f;
       break;
     default:
       break;
