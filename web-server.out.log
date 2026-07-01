@@ -1,3 +1,0 @@
-◇ injected env (7) from .env // tip: ⌘ multiple files { path: ['.env.local', '.env'] }
-Web: http://localhost:3001
-Serial: COM4 @ 115200

@@ -1,7 +1,0 @@
-◇ injected env (0) from .env // tip: ⌘ suppress logs { quiet: true }
-Web: http://localhost:3000
-Serial: COM4 @ 115200
-22.38.15 chat "Halo deck, chatbot Owi sudah siap!"
-22.38.16 send 37 bytes
-22.38.16 open COM4
-22.38.16 serial opened
