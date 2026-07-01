@@ -61,3 +61,6 @@ src/wifi_max_stream.cpp
 backend_*.js
 diagram.*
 src/test_blink.cpp
+
+Manual_Book_Gembot.md
+Wiring_Gembot.md
